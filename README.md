@@ -74,37 +74,37 @@ We propose a novel dual-stream paradigm VideoPainter that incorporates an effici
 
 Clone the repo:
 
-```
+```bash
 git clone https://github.com/TencentARC/VideoPainter.git
+cd VideoPainter
 ```
 
-We recommend you first use `conda` to create virtual environment, and install needed libraries. For example:
+We recommend using `uv` to manage the virtual environment and install the required libraries. This repo has been updated to support **CUDA 13.0** out of the box.
 
+Create a virtual environment with Python 3.10 and install dependencies:
 
-```
-conda create -n videopainter python=3.10 -y
-conda activate videopainter
-pip install -r requirements.txt
-```
+```bash
+# Create a virtual environment using Python 3.10 (managed by uv)
+uv venv --python 3.10
+source .venv/bin/activate
 
-Then, you can install diffusers (implemented in this repo) with:
-
-```
-cd ./diffusers
-pip install -e .
+# Install requirements using the CUDA 13.0 PyTorch index
+uv pip install -r requirements.txt
 ```
 
-After that, you can install required ffmpeg thourgh:
+Then, install the local packages as editable installations:
 
-```
-conda install -c conda-forge ffmpeg -y
+```bash
+# Install local packages as editables
+uv pip install -e ./diffusers
+uv pip install -e ./app --no-build-isolation
 ```
 
-Optional, you can install sam2 for gradio demo thourgh:
+Note that `ffmpeg` is required by the video processing utilities. If it is not already installed on your system, you can install it via your system's package manager:
 
-```
-cd ./app
-pip install -e .
+```bash
+# On Ubuntu/Debian:
+sudo apt-get update && sudo apt-get install -y ffmpeg
 ```
 </details>
 
@@ -173,18 +173,18 @@ git clone https://huggingface.co/datasets/TencentARC/VPData
 mv VPBench data
 
 # 1. unzip the masks in VPData
-python data_utils/unzip_folder.py --source_dir ./data/videovo_masks --target_dir ./data/video_inpainting/videovo
-python data_utils/unzip_folder.py --source_dir ./data/pexels_masks --target_dir ./data/video_inpainting/pexels
+uv run --python .venv python3 data_utils/unzip_folder.py --source_dir ./data/videovo_masks --target_dir ./data/video_inpainting/videovo
+uv run --python .venv python3 data_utils/unzip_folder.py --source_dir ./data/pexels_masks --target_dir ./data/video_inpainting/pexels
 
 # 2. unzip the raw videos in Videovo subset in VPData
-python data_utils/unzip_folder.py --source_dir ./data/videovo_raw_videos --target_dir ./data/videovo/raw_video
+uv run --python .venv python3 data_utils/unzip_folder.py --source_dir ./data/videovo_raw_videos --target_dir ./data/videovo/raw_video
 ```
 
 Noted: *Due to the space limit, you need to run the following script to download the raw videos of the Pexels subset in VPData. The format should be consistent with VPData/VPBench above (After download the VPData/VPBench, the script will automatically place the raw videos of VPData into the corresponding dataset directories that have been created by VPBench).*
 
 ```
 cd data_utils
-python VPData_download.py
+uv run --python ../.venv python3 VPData_download.py
 ```
 
 </details>
@@ -427,16 +427,131 @@ Since VideoPainter is trained on public Internet videos, it primarily performs w
 <details>
 <summary><b>Gradio Demo 🖌️</b></summary>
 
-You can also inference through gradio demo:
+You can launch an interactive web UI using Gradio to perform video inpainting and editing visually.
 
+### Step 1: Activate Virtual Environment
+Before starting, ensure you have activated your virtual environment:
+```bash
+source .venv/bin/activate
 ```
-# cd app
-CUDA_VISIBLE_DEVICES=0 python app.py \
+
+### Step 2: Prepare Checkpoints
+Make sure your checkpoints are placed in the `ckpt` directory. The expected folder structure is as follows:
+```text
+|-- ckpt
+    |-- VideoPainter/
+        |-- VideoPainter/checkpoints/branch/
+            |-- config.json
+            |-- diffusion_pytorch_model.safetensors
+        |-- VideoPainterID/checkpoints/
+            |-- pytorch_lora_weights.safetensors
+    |-- CogVideoX-5b-I2V/
+        |-- scheduler/
+        |-- transformer/
+        |-- vae/
+        |-- ...
+    |-- flux_inp/
+        |-- scheduler/
+        |-- transformer/
+        |-- vae/
+        |-- ...
+    |-- sam2_hiera_large.pt
+```
+
+*   **Download SAM 2 Model:**
+    ```bash
+    wget -O ckpt/sam2_hiera_large.pt https://huggingface.co/facebook/sam2-hiera-large/resolve/main/sam2_hiera_large.pt
+    ```
+*   **Download VideoPainter Checkpoints:**
+    ```bash
+    cd ckpt
+    git clone https://huggingface.co/TencentARC/VideoPainter
+    cd ..
+    ```
+*   **Download CogVideoX-5B-I2V Base Model:**
+    ```bash
+    cd ckpt
+    git clone https://huggingface.co/THUDM/CogVideoX-5b-I2V
+    cd ..
+    ```
+*   **Download FLUX.1 Fill Dev (Optional, for first frame inpainting):**
+    ```bash
+    cd ckpt
+    git clone https://huggingface.co/black-forest-labs/FLUX.1-Fill-dev flux_inp
+    cd ..
+    ```
+
+### Step 3: Run the Gradio Server
+Start the application from the `app` directory using `uv`:
+```bash
+cd app
+CUDA_VISIBLE_DEVICES=0 uv run --python ../.venv python3 app.py \
     --model_path ../ckpt/CogVideoX-5b-I2V \
-    --inpainting_branch ../ckpt/VideoPainter/checkpoints/branch \
-    --id_adapter ../ckpt/VideoPainterID/checkpoints \
+    --inpainting_branch ../ckpt/VideoPainter/VideoPainter/checkpoints/branch \
+    --id_adapter ../ckpt/VideoPainter/VideoPainterID/checkpoints \
     --img_inpainting_model ../ckpt/flux_inp
 ```
+
+*Optional Features:*
+*   **VRAM Optimization (Avoid CUDA OOM):** If you run into CUDA Out of Memory (OOM) errors (e.g., on 24GB GPUs like RTX 3090/4090 when loading both CogVideoX and FLUX models simultaneously), add the `--cpu_offload` flag to your command. This enables dynamic CPU offloading of inactive model components to host memory:
+    ```bash
+    CUDA_VISIBLE_DEVICES=0 uv run --python ../.venv python3 app.py \
+        --model_path ../ckpt/CogVideoX-5b-I2V \
+        --inpainting_branch ../ckpt/VideoPainter/VideoPainter/checkpoints/branch \
+        --id_adapter ../ckpt/VideoPainter/VideoPainterID/checkpoints \
+        --img_inpainting_model ../ckpt/flux_inp \
+        --server_port 8080 \
+        --cpu_offload
+    ```
+*   **OpenAI GPT-4o Prompt Enhancement:** If you want to use the automated prompt translation/enhancement features, create a `.env` file in the root of the repository (or in the `app` directory) and specify your OpenAI API key:
+    ```env
+    OPENAI_API_KEY="your-openai-api-key"
+    ```
+
+*   **Running on a Remote Server (SSH Port Forwarding):** If you are running the server on a remote machine (such as `vast-gpu`) via SSH, you can access the Gradio interface locally.
+
+    *   **Option A: Run Gradio on port 8081 using vast-gpu**
+        If port `8080` is in use on the remote machine (e.g., by Jupyter Notebook), launch the server on port `8081`:
+        ```bash
+        CUDA_VISIBLE_DEVICES=0 uv run --python ../.venv python3 app.py \
+            --model_path ../ckpt/CogVideoX-5b-I2V \
+            --inpainting_branch ../ckpt/VideoPainter/VideoPainter/checkpoints/branch \
+            --id_adapter ../ckpt/VideoPainter/VideoPainterID/checkpoints \
+            --img_inpainting_model ../ckpt/flux_inp \
+            --server_port 8081 \
+            --cpu_offload
+        ```
+        On your **local machine**, forward port `8081`:
+        ```bash
+        ssh -N -L 8081:127.0.0.1:8081 vast-gpu
+        ```
+        Then open `http://127.0.0.1:8081` in your browser.
+
+    *   **Option B: Launch with a public share link (Highly Recommended for remote instances)**
+        If you encounter loopback verification errors or connection disconnects, start the server with the `--share` flag. This creates a secure, temporary public `https://xxx.gradio.live` tunnel link:
+        ```bash
+        CUDA_VISIBLE_DEVICES=0 uv run --python ../.venv python3 app.py \
+            --model_path ../ckpt/CogVideoX-5b-I2V \
+            --inpainting_branch ../ckpt/VideoPainter/VideoPainter/checkpoints/branch \
+            --id_adapter ../ckpt/VideoPainter/VideoPainterID/checkpoints \
+            --img_inpainting_model ../ckpt/flux_inp \
+            --server_port 8081 \
+            --cpu_offload \
+            --share
+        ```
+        Then, simply open the generated `https://xxxx.gradio.live` link in your local web browser. No SSH port forwarding or local proxy setup is required.
+        If you start the Gradio server on its default port (`12346`), run the following command on your **local machine** to map it to your local port `8080`:
+        ```bash
+        ssh -N -L 8080:127.0.0.1:12346 vast-gpu
+        ```
+        Then, open `http://127.0.0.1:8080` in your local web browser.
+
+### Step 4: Using the Web UI
+1.  **Upload Video:** Drag and drop your input video (mp4/avi/etc.) into the upload box.
+2.  **Select Targets:** Click on the target object in the video frames to define the mask region. Use **Positive** clicks (green points) to add to the selection, and **Negative** clicks (red points) to remove areas.
+3.  **Run VOS Tracking:** Click the **Tracking** button to propagate the selection across all frames using SAM 2.
+4.  **Enter Captions:** Provide a descriptive caption for the video, edit instructions, and a description of the first frame.
+5.  **Inpaint:** Click **Inpaint** to generate the final edited/inpainted video.
 </details>
 
 

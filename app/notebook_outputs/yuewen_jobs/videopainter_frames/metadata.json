@@ -1,0 +1,20 @@
+{
+  "cfg_scale": 6.0,
+  "flux_output": {
+    "mtime_ns": 1782211864505436870,
+    "path": "/workspace/VideoPainter/app/notebook_outputs/yuewen_jobs_flux_first_frame.png",
+    "size": 275354
+  },
+  "frame_count": 48,
+  "frame_height": 480,
+  "frame_width": 720,
+  "id_adapter_path": "/workspace/VideoPainter/ckpt/VideoPainter/VideoPainterID/checkpoints",
+  "inference_dtype": "torch.float16",
+  "inpainting_branch_path": "/workspace/VideoPainter/ckpt/VideoPainter/VideoPainter/checkpoints/branch",
+  "prompt": "Jobs spoke at the press conference wearing a black shirt.",
+  "seed": 42,
+  "video_model_path": "/workspace/VideoPainter/ckpt/CogVideoX-5b-I2V",
+  "video_mtime_ns": 1782177485686203527,
+  "video_path": "/workspace/VideoPainter/app/assets/yuewen_jobs.mp4",
+  "video_size": 1736682
+}

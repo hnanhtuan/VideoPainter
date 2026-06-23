@@ -315,6 +315,15 @@ def generate_video(
         mask_id = meta_data['mask_id']
         start_frame = meta_data['start_frame']
         end_frame = meta_data['end_frame']
+        
+        # Check if dataset files exist (some samples from VPData are not in VPBench)
+        if not os.path.exists(mask_frames_path):
+            print(f"Mask file not found: {mask_frames_path}. Skipping sample {inpainting_sample_id}...")
+            return
+        if not os.path.exists(video_path):
+            print(f"Video file not found: {video_path}. Skipping sample {inpainting_sample_id}...")
+            return
+
         all_masks = np.load(mask_frames_path)["arr_0"]
         prompt = meta_data['caption']
 

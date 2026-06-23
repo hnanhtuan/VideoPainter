@@ -23,5 +23,7 @@ flagged
 .gradio
 app/result
 *tmp_gradio*
+infer/inp_fps8_dilate_32_test_gpt-4o/*
+.env
 
 !./app/assets/**

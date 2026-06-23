@@ -1,4 +1,20 @@
-export CUDA_VISIBLE_DEVICES=1
+#!/bin/bash
+# Locate the virtual environment relative to this script and activate it
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -d "$SCRIPT_DIR/../.venv" ]; then
+    source "$SCRIPT_DIR/../.venv/bin/activate"
+elif [ -d "$SCRIPT_DIR/.venv" ]; then
+    source "$SCRIPT_DIR/.venv/bin/activate"
+fi
+
+# Load environment variables from .env file if it exists
+if [ -f "$SCRIPT_DIR/../.env" ]; then
+    export $(grep -v '^#' "$SCRIPT_DIR/../.env" | xargs)
+elif [ -f "$SCRIPT_DIR/.env" ]; then
+    export $(grep -v '^#' "$SCRIPT_DIR/.env" | xargs)
+fi
+
+export CUDA_VISIBLE_DEVICES=0
 
 model_path="../ckpt/CogVideoX-5b-I2V"
 num_inference_steps=50
@@ -7,10 +23,10 @@ num_videos_per_prompt=1
 dtype="bfloat16"
 
 inpainting_branches=(
-    ../ckpt/VideoPainter/checkpoints/branch
+    ../ckpt/VideoPainter/VideoPainter/checkpoints/branch
 )
 
-id_adapter_resample_learnable_path=../ckpt/VideoPainterID/checkpoints
+id_adapter_resample_learnable_path=../ckpt/VideoPainter/VideoPainterID/checkpoints
 
 lora_rank=256
 

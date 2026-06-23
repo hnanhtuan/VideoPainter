@@ -1,4 +1,6 @@
 import os
+from dotenv import load_dotenv
+load_dotenv()  # Load environment variables from .env file
 # Set Gradio temp directory via environment variable
 GRADIO_TEMP_DIR = "./tmp_gradio"
 os.makedirs(GRADIO_TEMP_DIR, exist_ok=True)
@@ -31,13 +33,16 @@ from utils import load_model, generate_frames
 
 from sam2.build_sam import build_sam2_video_predictor
 
-vlm_model = OpenAI()
+vlm_model = OpenAI() if os.environ.get("OPENAI_API_KEY") else None
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--model_path", type=str, default="")
 parser.add_argument("--inpainting_branch", type=str, default="")
 parser.add_argument("--id_adapter", type=str, default="")
 parser.add_argument("--img_inpainting_model", type=str, default="../")
+parser.add_argument("--server_port", type=int, default=12346)
+parser.add_argument("--cpu_offload", action="store_true", help="Enable CPU offloading to save VRAM")
+parser.add_argument("--share", action="store_true", help="Generate a public shareable link")
 args = parser.parse_args()
 
 sam2_checkpoint = "../ckpt/sam2_hiera_large.pt"
@@ -50,7 +55,8 @@ validation_pipeline, validation_pipeline_img = load_model(
         model_path=args.model_path,
         inpainting_branch=args.inpainting_branch,
         id_adapter=args.id_adapter,
-        img_inpainting_model=args.img_inpainting_model
+        img_inpainting_model=args.img_inpainting_model,
+        cpu_offload=args.cpu_offload
     )
 
 print(f"Load model done!")
@@ -589,14 +595,14 @@ def inpaint_video(video_state, video_caption, target_region_frame1_caption, inte
 
 # generate video after vos inference
 def generate_video_from_frames(frames, output_path, fps=8):
-    # print(f"func-generate_video_from_frames: {frames.shape}, {frames.dtype}")
-    #  torch.Size([49, 480, 720, 3]), torch.uint8
-    frames = torch.from_numpy(np.asarray(frames))
-    frames = frames.to(torch.uint8) 
-    # print(f"func-generate_video_from_frames: {frames.shape}, {frames.dtype}")
     if not os.path.exists(os.path.dirname(output_path)):
         os.makedirs(os.path.dirname(output_path))
-    torchvision.io.write_video(output_path, frames, fps=fps, video_codec="libx264")
+    frames_np = np.asarray(frames, dtype=np.uint8)
+    import imageio
+    writer = imageio.get_writer(output_path, fps=fps, codec='libx264')
+    for frame in frames_np:
+        writer.append_data(frame)
+    writer.close()
     return output_path
 
 def echo_text(text1, text2):
@@ -636,7 +642,7 @@ def process_example(video_input, video_caption, target_region_frame1_caption, pr
         )
     
     print(f"Begin function process_example!!")
-    video_state = gr.State({
+    video_state = {
         "user_name": "",
         "video_name": "",
         "origin_images": None,
@@ -647,7 +653,7 @@ def process_example(video_input, video_caption, target_region_frame1_caption, pr
         "select_frame_number": 0,
         "fps": 8,
         "ann_obj_id": 0
-    })
+    }
     results = get_frames_from_video(video_input, video_state)
     print(f"func-process_example-results: {len(results)}")
     
@@ -706,6 +712,33 @@ def process_example(video_input, video_caption, target_region_frame1_caption, pr
         )
     
     return results
+
+def load_example(video_input, video_caption, target_region_frame1_caption, prompt, model_type, editing_instruction, seed_param, cfg_scale, dilate_size, click_state):
+    print(f"func-load_example-video_input: {video_input}")
+    results = process_example(video_input, video_caption, target_region_frame1_caption, prompt, click_state)
+    return (
+        results[0],   # video_caption
+        results[1],   # target_region_frame1_caption
+        results[2],   # inference_state
+        results[3],   # video_state
+        results[4],   # video_info
+        results[5],   # template_frame
+        results[6],   # image_selection_slider
+        results[7],   # track_pause_number_slider
+        results[8],   # point_prompt
+        results[9],   # clear_button_click
+        results[10],  # tracking_video_predict_button
+        results[11],  # video_output
+        results[12],  # inpaint_video_predict_button
+        results[13],  # run_status
+        results[14],  # video_input
+        model_type,
+        editing_instruction,
+        seed_param,
+        cfg_scale,
+        dilate_size,
+        click_state,
+    )
 
 def convert_prompt(prompt: str, retry_times: int = 3) -> str:
     if not os.environ.get("OPENAI_API_KEY"):
@@ -1213,6 +1246,30 @@ Plug-and-Play Context Control</h3>
                 dilate_size,
                 click_state,
             ],
+            outputs=[
+                video_caption, 
+                target_region_frame1_caption, 
+                inference_state, 
+                video_state, 
+                video_info, 
+                template_frame,
+                image_selection_slider, 
+                track_pause_number_slider,
+                point_prompt, 
+                clear_button_click,
+                tracking_video_predict_button,
+                video_output, 
+                inpaint_video_predict_button,
+                run_status,
+                video_input,
+                model_type,
+                editing_instruction,
+                seed_param,
+                cfg_scale,
+                dilate_size,
+                click_state,
+            ],
+            fn=load_example,
             examples_per_page=20,
             cache_examples=False,
         )
@@ -1406,7 +1463,7 @@ Plug-and-Play Context Control</h3>
 
 iface.queue().launch(
     server_name="0.0.0.0", 
-    server_port=12346, 
-    share=False,
+    server_port=args.server_port, 
+    share=args.share,
     allowed_paths=["./assets/"],
 )

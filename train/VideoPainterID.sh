@@ -1,5 +1,14 @@
+#!/bin/bash
+# Locate the virtual environment relative to this script and activate it
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -d "$SCRIPT_DIR/../.venv" ]; then
+    source "$SCRIPT_DIR/../.venv/bin/activate"
+elif [ -d "$SCRIPT_DIR/.venv" ]; then
+    source "$SCRIPT_DIR/.venv/bin/activate"
+fi
+
 export MODEL_PATH="../ckpt/CogVideoX-5b-I2V"
-export BRANCH_MODEL_PATH="../ckpt/VideoPainter/checkpoints/branch"
+export BRANCH_MODEL_PATH="../ckpt/VideoPainter/VideoPainter/checkpoints/branch"
 export CACHE_PATH="~/.cache"
 export DATASET_PATH="../data/videovo/raw_video"
 export PROJECT_NAME="pexels_videovo-inpainting"
