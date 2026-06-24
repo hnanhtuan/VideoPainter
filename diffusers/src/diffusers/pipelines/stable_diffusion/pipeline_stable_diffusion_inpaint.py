@@ -1,4 +1,4 @@
-# Copyright 2024 The HuggingFace Team. All rights reserved.
+# Copyright 2025 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,7 +13,7 @@
 # limitations under the License.
 
 import inspect
-from typing import Any, Callable, Dict, List, Optional, Union
+from typing import Any, Callable
 
 import PIL.Image
 import torch
@@ -27,19 +27,33 @@ from ...loaders import FromSingleFileMixin, IPAdapterMixin, StableDiffusionLoraL
 from ...models import AsymmetricAutoencoderKL, AutoencoderKL, ImageProjection, UNet2DConditionModel
 from ...models.lora import adjust_lora_scale_text_encoder
 from ...schedulers import KarrasDiffusionSchedulers
-from ...utils import USE_PEFT_BACKEND, deprecate, logging, scale_lora_layers, unscale_lora_layers
+from ...utils import (
+    USE_PEFT_BACKEND,
+    deprecate,
+    is_torch_xla_available,
+    logging,
+    scale_lora_layers,
+    unscale_lora_layers,
+)
 from ...utils.torch_utils import randn_tensor
 from ..pipeline_utils import DiffusionPipeline, StableDiffusionMixin
 from . import StableDiffusionPipelineOutput
 from .safety_checker import StableDiffusionSafetyChecker
 
 
+if is_torch_xla_available():
+    import torch_xla.core.xla_model as xm
+
+    XLA_AVAILABLE = True
+else:
+    XLA_AVAILABLE = False
+
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
 
 # Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_img2img.retrieve_latents
 def retrieve_latents(
-    encoder_output: torch.Tensor, generator: Optional[torch.Generator] = None, sample_mode: str = "sample"
+    encoder_output: torch.Tensor, generator: torch.Generator | None = None, sample_mode: str = "sample"
 ):
     if hasattr(encoder_output, "latent_dist") and sample_mode == "sample":
         return encoder_output.latent_dist.sample(generator)
@@ -54,13 +68,13 @@ def retrieve_latents(
 # Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion.retrieve_timesteps
 def retrieve_timesteps(
     scheduler,
-    num_inference_steps: Optional[int] = None,
-    device: Optional[Union[str, torch.device]] = None,
-    timesteps: Optional[List[int]] = None,
-    sigmas: Optional[List[float]] = None,
+    num_inference_steps: int | None = None,
+    device: str | torch.device | None = None,
+    timesteps: list[int] | None = None,
+    sigmas: list[float] | None = None,
     **kwargs,
 ):
-    """
+    r"""
     Calls the scheduler's `set_timesteps` method and retrieves timesteps from the scheduler after the call. Handles
     custom timesteps. Any kwargs will be supplied to `scheduler.set_timesteps`.
 
@@ -72,15 +86,15 @@ def retrieve_timesteps(
             must be `None`.
         device (`str` or `torch.device`, *optional*):
             The device to which the timesteps should be moved to. If `None`, the timesteps are not moved.
-        timesteps (`List[int]`, *optional*):
+        timesteps (`list[int]`, *optional*):
             Custom timesteps used to override the timestep spacing strategy of the scheduler. If `timesteps` is passed,
             `num_inference_steps` and `sigmas` must be `None`.
-        sigmas (`List[float]`, *optional*):
+        sigmas (`list[float]`, *optional*):
             Custom sigmas used to override the timestep spacing strategy of the scheduler. If `sigmas` is passed,
             `num_inference_steps` and `timesteps` must be `None`.
 
     Returns:
-        `Tuple[torch.Tensor, int]`: A tuple where the first element is the timestep schedule from the scheduler and the
+        `tuple[torch.Tensor, int]`: A tuple where the first element is the timestep schedule from the scheduler and the
         second element is the number of inference steps.
     """
     if timesteps is not None and sigmas is not None:
@@ -146,8 +160,8 @@ class StableDiffusionInpaintPipeline(
             [`DDIMScheduler`], [`LMSDiscreteScheduler`], or [`PNDMScheduler`].
         safety_checker ([`StableDiffusionSafetyChecker`]):
             Classification module that estimates whether generated images could be considered offensive or harmful.
-            Please refer to the [model card](https://huggingface.co/runwayml/stable-diffusion-v1-5) for more details
-            about a model's potential harms.
+            Please refer to the [model card](https://huggingface.co/stable-diffusion-v1-5/stable-diffusion-v1-5) for
+            more details about a model's potential harms.
         feature_extractor ([`~transformers.CLIPImageProcessor`]):
             A `CLIPImageProcessor` to extract features from generated images; used as inputs to the `safety_checker`.
     """
@@ -159,7 +173,7 @@ class StableDiffusionInpaintPipeline(
 
     def __init__(
         self,
-        vae: Union[AutoencoderKL, AsymmetricAutoencoderKL],
+        vae: AutoencoderKL | AsymmetricAutoencoderKL,
         text_encoder: CLIPTextModel,
         tokenizer: CLIPTokenizer,
         unet: UNet2DConditionModel,
@@ -171,7 +185,7 @@ class StableDiffusionInpaintPipeline(
     ):
         super().__init__()
 
-        if hasattr(scheduler.config, "steps_offset") and scheduler.config.steps_offset != 1:
+        if scheduler is not None and getattr(scheduler.config, "steps_offset", 1) != 1:
             deprecation_message = (
                 f"The configuration file of this scheduler: {scheduler} is outdated. `steps_offset`"
                 f" should be set to 1 instead of {scheduler.config.steps_offset}. Please make sure "
@@ -185,7 +199,7 @@ class StableDiffusionInpaintPipeline(
             new_config["steps_offset"] = 1
             scheduler._internal_dict = FrozenDict(new_config)
 
-        if hasattr(scheduler.config, "skip_prk_steps") and scheduler.config.skip_prk_steps is False:
+        if scheduler is not None and getattr(scheduler.config, "skip_prk_steps", True) is False:
             deprecation_message = (
                 f"The configuration file of this scheduler: {scheduler} has not set the configuration"
                 " `skip_prk_steps`. `skip_prk_steps` should be set to True in the configuration file. Please make"
@@ -215,17 +229,21 @@ class StableDiffusionInpaintPipeline(
                 " checker. If you do not want to use the safety checker, you can pass `'safety_checker=None'` instead."
             )
 
-        is_unet_version_less_0_9_0 = hasattr(unet.config, "_diffusers_version") and version.parse(
-            version.parse(unet.config._diffusers_version).base_version
-        ) < version.parse("0.9.0.dev0")
-        is_unet_sample_size_less_64 = hasattr(unet.config, "sample_size") and unet.config.sample_size < 64
+        is_unet_version_less_0_9_0 = (
+            unet is not None
+            and hasattr(unet.config, "_diffusers_version")
+            and version.parse(version.parse(unet.config._diffusers_version).base_version) < version.parse("0.9.0.dev0")
+        )
+        is_unet_sample_size_less_64 = (
+            unet is not None and hasattr(unet.config, "sample_size") and unet.config.sample_size < 64
+        )
         if is_unet_version_less_0_9_0 and is_unet_sample_size_less_64:
             deprecation_message = (
                 "The configuration file of the unet has set the default `sample_size` to smaller than"
                 " 64 which seems highly unlikely .If you're checkpoint is a fine-tuned version of any of the"
                 " following: \n- CompVis/stable-diffusion-v1-4 \n- CompVis/stable-diffusion-v1-3 \n-"
-                " CompVis/stable-diffusion-v1-2 \n- CompVis/stable-diffusion-v1-1 \n- runwayml/stable-diffusion-v1-5"
-                " \n- runwayml/stable-diffusion-inpainting \n you should change 'sample_size' to 64 in the"
+                " CompVis/stable-diffusion-v1-2 \n- CompVis/stable-diffusion-v1-1 \n- stable-diffusion-v1-5/stable-diffusion-v1-5"
+                " \n- stable-diffusion-v1-5/stable-diffusion-inpainting \n you should change 'sample_size' to 64 in the"
                 " configuration file. Please make sure to update the config accordingly as leaving `sample_size=32`"
                 " in the config might lead to incorrect results in future versions. If you have downloaded this"
                 " checkpoint from the Hugging Face Hub, it would be very nice if you could open a Pull request for"
@@ -237,7 +255,7 @@ class StableDiffusionInpaintPipeline(
             unet._internal_dict = FrozenDict(new_config)
 
         # Check shapes, assume num_channels_latents == 4, num_channels_mask == 1, num_channels_masked == 4
-        if unet.config.in_channels != 9:
+        if unet is not None and unet.config.in_channels != 9:
             logger.info(f"You have loaded a UNet with {unet.config.in_channels} input channels which.")
 
         self.register_modules(
@@ -250,7 +268,7 @@ class StableDiffusionInpaintPipeline(
             feature_extractor=feature_extractor,
             image_encoder=image_encoder,
         )
-        self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1)
+        self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1) if getattr(self, "vae", None) else 8
         self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor)
         self.mask_processor = VaeImageProcessor(
             vae_scale_factor=self.vae_scale_factor, do_normalize=False, do_binarize=True, do_convert_grayscale=True
@@ -265,9 +283,9 @@ class StableDiffusionInpaintPipeline(
         num_images_per_prompt,
         do_classifier_free_guidance,
         negative_prompt=None,
-        prompt_embeds: Optional[torch.Tensor] = None,
-        negative_prompt_embeds: Optional[torch.Tensor] = None,
-        lora_scale: Optional[float] = None,
+        prompt_embeds: torch.Tensor | None = None,
+        negative_prompt_embeds: torch.Tensor | None = None,
+        lora_scale: float | None = None,
         **kwargs,
     ):
         deprecation_message = "`_encode_prompt()` is deprecated and it will be removed in a future version. Use `encode_prompt()` instead. Also, be aware that the output format changed from a concatenated tensor to a tuple."
@@ -298,16 +316,16 @@ class StableDiffusionInpaintPipeline(
         num_images_per_prompt,
         do_classifier_free_guidance,
         negative_prompt=None,
-        prompt_embeds: Optional[torch.Tensor] = None,
-        negative_prompt_embeds: Optional[torch.Tensor] = None,
-        lora_scale: Optional[float] = None,
-        clip_skip: Optional[int] = None,
+        prompt_embeds: torch.Tensor | None = None,
+        negative_prompt_embeds: torch.Tensor | None = None,
+        lora_scale: float | None = None,
+        clip_skip: int | None = None,
     ):
         r"""
         Encodes the prompt into text encoder hidden states.
 
         Args:
-            prompt (`str` or `List[str]`, *optional*):
+            prompt (`str` or `list[str]`, *optional*):
                 prompt to be encoded
             device: (`torch.device`):
                 torch device
@@ -315,7 +333,7 @@ class StableDiffusionInpaintPipeline(
                 number of images that should be generated per prompt
             do_classifier_free_guidance (`bool`):
                 whether to use classifier free guidance or not
-            negative_prompt (`str` or `List[str]`, *optional*):
+            negative_prompt (`str` or `list[str]`, *optional*):
                 The prompt or prompts not to guide the image generation. If not defined, one has to pass
                 `negative_prompt_embeds` instead. Ignored when not using guidance (i.e., ignored if `guidance_scale` is
                 less than `1`).
@@ -414,7 +432,7 @@ class StableDiffusionInpaintPipeline(
 
         # get unconditional embeddings for classifier free guidance
         if do_classifier_free_guidance and negative_prompt_embeds is None:
-            uncond_tokens: List[str]
+            uncond_tokens: list[str]
             if negative_prompt is None:
                 uncond_tokens = [""] * batch_size
             elif prompt is not None and type(prompt) is not type(negative_prompt):
@@ -563,7 +581,7 @@ class StableDiffusionInpaintPipeline(
     def prepare_extra_step_kwargs(self, generator, eta):
         # prepare extra kwargs for the scheduler step, since not all schedulers have the same signature
         # eta (η) is only used with the DDIMScheduler, it will be ignored for other schedulers.
-        # eta corresponds to η in DDIM paper: https://arxiv.org/abs/2010.02502
+        # eta corresponds to η in DDIM paper: https://huggingface.co/papers/2010.02502
         # and should be between [0, 1]
 
         accepts_eta = "eta" in set(inspect.signature(self.scheduler.step).parameters.keys())
@@ -642,7 +660,7 @@ class StableDiffusionInpaintPipeline(
         if padding_mask_crop is not None:
             if not isinstance(image, PIL.Image.Image):
                 raise ValueError(
-                    f"The image should be a PIL image when inpainting mask crop, but is of type" f" {type(image)}."
+                    f"The image should be a PIL image when inpainting mask crop, but is of type {type(image)}."
                 )
             if not isinstance(mask_image, PIL.Image.Image):
                 raise ValueError(
@@ -650,7 +668,7 @@ class StableDiffusionInpaintPipeline(
                     f" {type(mask_image)}."
                 )
             if output_type != "pil":
-                raise ValueError(f"The output type should be PIL when inpainting mask crop, but is" f" {output_type}.")
+                raise ValueError(f"The output type should be PIL when inpainting mask crop, but is {output_type}.")
 
         if ip_adapter_image is not None and ip_adapter_image_embeds is not None:
             raise ValueError(
@@ -841,7 +859,7 @@ class StableDiffusionInpaintPipeline(
         return self._clip_skip
 
     # here `guidance_scale` is defined analog to the guidance weight `w` of equation (2)
-    # of the Imagen paper: https://arxiv.org/pdf/2205.11487.pdf . `guidance_scale = 1`
+    # of the Imagen paper: https://huggingface.co/papers/2205.11487 . `guidance_scale = 1`
     # corresponds to doing no classifier free guidance.
     @property
     def do_classifier_free_guidance(self):
@@ -862,57 +880,57 @@ class StableDiffusionInpaintPipeline(
     @torch.no_grad()
     def __call__(
         self,
-        prompt: Union[str, List[str]] = None,
+        prompt: str | list[str] = None,
         image: PipelineImageInput = None,
         mask_image: PipelineImageInput = None,
         masked_image_latents: torch.Tensor = None,
-        height: Optional[int] = None,
-        width: Optional[int] = None,
-        padding_mask_crop: Optional[int] = None,
+        height: int | None = None,
+        width: int | None = None,
+        padding_mask_crop: int | None = None,
         strength: float = 1.0,
         num_inference_steps: int = 50,
-        timesteps: List[int] = None,
-        sigmas: List[float] = None,
+        timesteps: list[int] = None,
+        sigmas: list[float] = None,
         guidance_scale: float = 7.5,
-        negative_prompt: Optional[Union[str, List[str]]] = None,
-        num_images_per_prompt: Optional[int] = 1,
+        negative_prompt: str | list[str] | None = None,
+        num_images_per_prompt: int | None = 1,
         eta: float = 0.0,
-        generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
-        latents: Optional[torch.Tensor] = None,
-        prompt_embeds: Optional[torch.Tensor] = None,
-        negative_prompt_embeds: Optional[torch.Tensor] = None,
-        ip_adapter_image: Optional[PipelineImageInput] = None,
-        ip_adapter_image_embeds: Optional[List[torch.Tensor]] = None,
-        output_type: Optional[str] = "pil",
+        generator: torch.Generator | list[torch.Generator] | None = None,
+        latents: torch.Tensor | None = None,
+        prompt_embeds: torch.Tensor | None = None,
+        negative_prompt_embeds: torch.Tensor | None = None,
+        ip_adapter_image: PipelineImageInput | None = None,
+        ip_adapter_image_embeds: list[torch.Tensor] | None = None,
+        output_type: str | None = "pil",
         return_dict: bool = True,
-        cross_attention_kwargs: Optional[Dict[str, Any]] = None,
+        cross_attention_kwargs: dict[str, Any] | None = None,
         clip_skip: int = None,
-        callback_on_step_end: Optional[
-            Union[Callable[[int, int, Dict], None], PipelineCallback, MultiPipelineCallbacks]
-        ] = None,
-        callback_on_step_end_tensor_inputs: List[str] = ["latents"],
+        callback_on_step_end: Callable[[int, int], None] | PipelineCallback | MultiPipelineCallbacks | None = None,
+        callback_on_step_end_tensor_inputs: list[str] = ["latents"],
         **kwargs,
     ):
         r"""
         The call function to the pipeline for generation.
 
         Args:
-            prompt (`str` or `List[str]`, *optional*):
+            prompt (`str` or `list[str]`, *optional*):
                 The prompt or prompts to guide image generation. If not defined, you need to pass `prompt_embeds`.
-            image (`torch.Tensor`, `PIL.Image.Image`, `np.ndarray`, `List[torch.Tensor]`, `List[PIL.Image.Image]`, or `List[np.ndarray]`):
+            image (`torch.Tensor`, `PIL.Image.Image`, `np.ndarray`, `list[torch.Tensor]`, `list[PIL.Image.Image]`, or `list[np.ndarray]`):
                 `Image`, numpy array or tensor representing an image batch to be inpainted (which parts of the image to
                 be masked out with `mask_image` and repainted according to `prompt`). For both numpy array and pytorch
                 tensor, the expected value range is between `[0, 1]` If it's a tensor or a list or tensors, the
                 expected shape should be `(B, C, H, W)` or `(C, H, W)`. If it is a numpy array or a list of arrays, the
                 expected shape should be `(B, H, W, C)` or `(H, W, C)` It can also accept image latents as `image`, but
                 if passing latents directly it is not encoded again.
-            mask_image (`torch.Tensor`, `PIL.Image.Image`, `np.ndarray`, `List[torch.Tensor]`, `List[PIL.Image.Image]`, or `List[np.ndarray]`):
+            mask_image (`torch.Tensor`, `PIL.Image.Image`, `np.ndarray`, `list[torch.Tensor]`, `list[PIL.Image.Image]`, or `list[np.ndarray]`):
                 `Image`, numpy array or tensor representing an image batch to mask `image`. White pixels in the mask
                 are repainted while black pixels are preserved. If `mask_image` is a PIL image, it is converted to a
                 single channel (luminance) before use. If it's a numpy array or pytorch tensor, it should contain one
                 color channel (L) instead of 3, so the expected shape for pytorch tensor would be `(B, 1, H, W)`, `(B,
                 H, W)`, `(1, H, W)`, `(H, W)`. And for numpy array would be for `(B, H, W, 1)`, `(B, H, W)`, `(H, W,
                 1)`, or `(H, W)`.
+            masked_image_latents (`torch.Tensor`, *optional*):
+                Pre-encoded latent of the masked image (for inpainting).
             height (`int`, *optional*, defaults to `self.unet.config.sample_size * self.vae_scale_factor`):
                 The height in pixels of the generated image.
             width (`int`, *optional*, defaults to `self.unet.config.sample_size * self.vae_scale_factor`):
@@ -933,26 +951,26 @@ class StableDiffusionInpaintPipeline(
             num_inference_steps (`int`, *optional*, defaults to 50):
                 The number of denoising steps. More denoising steps usually lead to a higher quality image at the
                 expense of slower inference. This parameter is modulated by `strength`.
-            timesteps (`List[int]`, *optional*):
+            timesteps (`list[int]`, *optional*):
                 Custom timesteps to use for the denoising process with schedulers which support a `timesteps` argument
                 in their `set_timesteps` method. If not defined, the default behavior when `num_inference_steps` is
                 passed will be used. Must be in descending order.
-            sigmas (`List[float]`, *optional*):
+            sigmas (`list[float]`, *optional*):
                 Custom sigmas to use for the denoising process with schedulers which support a `sigmas` argument in
                 their `set_timesteps` method. If not defined, the default behavior when `num_inference_steps` is passed
                 will be used.
             guidance_scale (`float`, *optional*, defaults to 7.5):
                 A higher guidance scale value encourages the model to generate images closely linked to the text
                 `prompt` at the expense of lower image quality. Guidance scale is enabled when `guidance_scale > 1`.
-            negative_prompt (`str` or `List[str]`, *optional*):
+            negative_prompt (`str` or `list[str]`, *optional*):
                 The prompt or prompts to guide what to not include in image generation. If not defined, you need to
                 pass `negative_prompt_embeds` instead. Ignored when not using guidance (`guidance_scale < 1`).
             num_images_per_prompt (`int`, *optional*, defaults to 1):
                 The number of images to generate per prompt.
             eta (`float`, *optional*, defaults to 0.0):
-                Corresponds to parameter eta (η) from the [DDIM](https://arxiv.org/abs/2010.02502) paper. Only applies
-                to the [`~schedulers.DDIMScheduler`], and is ignored in other schedulers.
-            generator (`torch.Generator` or `List[torch.Generator]`, *optional*):
+                Corresponds to parameter eta (η) from the [DDIM](https://huggingface.co/papers/2010.02502) paper. Only
+                applies to the [`~schedulers.DDIMScheduler`], and is ignored in other schedulers.
+            generator (`torch.Generator` or `list[torch.Generator]`, *optional*):
                 A [`torch.Generator`](https://pytorch.org/docs/stable/generated/torch.Generator.html) to make
                 generation deterministic.
             latents (`torch.Tensor`, *optional*):
@@ -966,7 +984,7 @@ class StableDiffusionInpaintPipeline(
                 Pre-generated negative text embeddings. Can be used to easily tweak text inputs (prompt weighting). If
                 not provided, `negative_prompt_embeds` are generated from the `negative_prompt` input argument.
             ip_adapter_image: (`PipelineImageInput`, *optional*): Optional image input to work with IP Adapters.
-            ip_adapter_image_embeds (`List[torch.Tensor]`, *optional*):
+            ip_adapter_image_embeds (`list[torch.Tensor]`, *optional*):
                 Pre-generated image embeddings for IP-Adapter. It should be a list of length same as number of
                 IP-adapters. Each element should be a tensor of shape `(batch_size, num_images, emb_dim)`. It should
                 contain the negative image embedding if `do_classifier_free_guidance` is set to `True`. If not
@@ -987,7 +1005,7 @@ class StableDiffusionInpaintPipeline(
                 each denoising step during the inference. with the following arguments: `callback_on_step_end(self:
                 DiffusionPipeline, step: int, timestep: int, callback_kwargs: Dict)`. `callback_kwargs` will include a
                 list of all tensors as specified by `callback_on_step_end_tensor_inputs`.
-            callback_on_step_end_tensor_inputs (`List`, *optional*):
+            callback_on_step_end_tensor_inputs (`list`, *optional*):
                 The list of tensor inputs for the `callback_on_step_end` function. The tensors specified in the list
                 will be passed as `callback_kwargs` argument. You will only be able to include variables listed in the
                 `._callback_tensor_inputs` attribute of your pipeline class.
@@ -1014,7 +1032,7 @@ class StableDiffusionInpaintPipeline(
         >>> mask_image = download_image(mask_url).resize((512, 512))
 
         >>> pipe = StableDiffusionInpaintPipeline.from_pretrained(
-        ...     "runwayml/stable-diffusion-inpainting", torch_dtype=torch.float16
+        ...     "stable-diffusion-v1-5/stable-diffusion-inpainting", torch_dtype=torch.float16
         ... )
         >>> pipe = pipe.to("cuda")
 
@@ -1118,8 +1136,12 @@ class StableDiffusionInpaintPipeline(
             )
 
         # 4. set timesteps
+        if XLA_AVAILABLE:
+            timestep_device = "cpu"
+        else:
+            timestep_device = device
         timesteps, num_inference_steps = retrieve_timesteps(
-            self.scheduler, num_inference_steps, device, timesteps, sigmas
+            self.scheduler, num_inference_steps, timestep_device, timesteps, sigmas
         )
         timesteps, num_inference_steps = self.get_timesteps(
             num_inference_steps=num_inference_steps, strength=strength, device=device
@@ -1200,7 +1222,7 @@ class StableDiffusionInpaintPipeline(
 
         # 8. Check that sizes of mask, masked image and latents match
         if num_channels_unet == 9:
-            # default case for runwayml/stable-diffusion-inpainting
+            # default case for stable-diffusion-v1-5/stable-diffusion-inpainting
             num_channels_mask = mask.shape[1]
             num_channels_masked_image = masked_image_latents.shape[1]
             if num_channels_latents + num_channels_mask + num_channels_masked_image != self.unet.config.in_channels:
@@ -1208,7 +1230,7 @@ class StableDiffusionInpaintPipeline(
                     f"Incorrect configuration settings! The config of `pipeline.unet`: {self.unet.config} expects"
                     f" {self.unet.config.in_channels} but received `num_channels_latents`: {num_channels_latents} +"
                     f" `num_channels_mask`: {num_channels_mask} + `num_channels_masked_image`: {num_channels_masked_image}"
-                    f" = {num_channels_latents+num_channels_masked_image+num_channels_mask}. Please verify the config of"
+                    f" = {num_channels_latents + num_channels_masked_image + num_channels_mask}. Please verify the config of"
                     " `pipeline.unet` or your `mask_image` or `image` input."
                 )
         elif num_channels_unet != 4:
@@ -1302,6 +1324,9 @@ class StableDiffusionInpaintPipeline(
                     if callback is not None and i % callback_steps == 0:
                         step_idx = i // getattr(self.scheduler, "order", 1)
                         callback(step_idx, t, latents)
+
+                if XLA_AVAILABLE:
+                    xm.mark_step()
 
         if not output_type == "latent":
             condition_kwargs = {}

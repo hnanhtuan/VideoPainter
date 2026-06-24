@@ -1,4 +1,4 @@
-# Copyright 2024 The HuggingFace Team. All rights reserved.
+# Copyright 2025 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,13 +15,12 @@ import os
 from collections import defaultdict
 from contextlib import nullcontext
 from pathlib import Path
-from typing import Callable, Dict, Union
+from typing import Callable
 
 import safetensors
 import torch
 import torch.nn.functional as F
 from huggingface_hub.utils import validate_hf_hub_args
-from torch import nn
 
 from ..models.embeddings import (
     ImageProjection,
@@ -31,11 +30,13 @@ from ..models.embeddings import (
     IPAdapterPlusImageProjection,
     MultiIPAdapterImageProjection,
 )
-from ..models.modeling_utils import load_model_dict_into_meta, load_state_dict
+from ..models.model_loading_utils import load_model_dict_into_meta
+from ..models.modeling_utils import _LOW_CPU_MEM_USAGE_DEFAULT, load_state_dict
 from ..utils import (
     USE_PEFT_BACKEND,
     _get_model_file,
     convert_unet_state_dict_to_peft,
+    deprecate,
     get_adapter_name,
     get_peft_kwargs,
     is_accelerate_available,
@@ -43,12 +44,11 @@ from ..utils import (
     is_torch_version,
     logging,
 )
+from ..utils.torch_utils import empty_device_cache
+from .lora_base import _func_optionally_disable_offloading
 from .lora_pipeline import LORA_WEIGHT_NAME, LORA_WEIGHT_NAME_SAFE, TEXT_ENCODER_NAME, UNET_NAME
 from .utils import AttnProcsLayers
 
-
-if is_accelerate_available():
-    from accelerate.hooks import AlignDevicesHook, CpuOffload, remove_hook_from_module
 
 logger = logging.get_logger(__name__)
 
@@ -66,7 +66,7 @@ class UNet2DConditionLoadersMixin:
     unet_name = UNET_NAME
 
     @validate_hf_hub_args
-    def load_attn_procs(self, pretrained_model_name_or_path_or_dict: Union[str, Dict[str, torch.Tensor]], **kwargs):
+    def load_attn_procs(self, pretrained_model_name_or_path_or_dict: str | dict[str, torch.Tensor], **kwargs):
         r"""
         Load pretrained attention processor layers into [`UNet2DConditionModel`]. Attention processor layers have to be
         defined in
@@ -85,14 +85,14 @@ class UNet2DConditionLoadersMixin:
                     - A [torch state
                       dict](https://pytorch.org/tutorials/beginner/saving_loading_models.html#what-is-a-state-dict).
 
-            cache_dir (`Union[str, os.PathLike]`, *optional*):
+            cache_dir (`str | os.PathLike`, *optional*):
                 Path to a directory where a downloaded pretrained model configuration is cached if the standard cache
                 is not used.
             force_download (`bool`, *optional*, defaults to `False`):
                 Whether or not to force the (re-)download of the model weights and configuration files, overriding the
                 cached versions if they exist.
 
-            proxies (`Dict[str, str]`, *optional*):
+            proxies (`dict[str, str]`, *optional*):
                 A dictionary of proxy servers to use by protocol or endpoint, for example, `{'http': 'foo.bar:3128',
                 'http://hostname': 'foo.bar:4012'}`. The proxies are used on each request.
             local_files_only (`bool`, *optional*, defaults to `False`):
@@ -106,7 +106,7 @@ class UNet2DConditionLoadersMixin:
                 allowed by Git.
             subfolder (`str`, *optional*, defaults to `""`):
                 The subfolder location of a model file within a larger model repository on the Hub or locally.
-            network_alphas (`Dict[str, float]`):
+            network_alphas (`dict[str, float]`):
                 The value of the network alpha used for stable learning and preventing underflow. This value has the
                 same meaning as the `--network_alpha` option in the kohya-ss trainer script. Refer to [this
                 link](https://github.com/darkstorm2150/sd-scripts/blob/main/docs/train_network_README-en.md#execute-learning).
@@ -115,6 +115,9 @@ class UNet2DConditionLoadersMixin:
                 `default_{i}` where i is the total number of adapters being loaded.
             weight_name (`str`, *optional*, defaults to None):
                 Name of the serialized state dict file.
+            low_cpu_mem_usage (`bool`, *optional*):
+                Speed up model loading by only loading the pretrained LoRA weights and not initializing the random
+                weights.
 
         Example:
 
@@ -130,6 +133,8 @@ class UNet2DConditionLoadersMixin:
         )
         ```
         """
+        from ..hooks.group_offloading import _maybe_remove_and_reapply_group_offloading
+
         cache_dir = kwargs.pop("cache_dir", None)
         force_download = kwargs.pop("force_download", False)
         proxies = kwargs.pop("proxies", None)
@@ -142,16 +147,19 @@ class UNet2DConditionLoadersMixin:
         adapter_name = kwargs.pop("adapter_name", None)
         _pipeline = kwargs.pop("_pipeline", None)
         network_alphas = kwargs.pop("network_alphas", None)
+        low_cpu_mem_usage = kwargs.pop("low_cpu_mem_usage", _LOW_CPU_MEM_USAGE_DEFAULT)
         allow_pickle = False
+
+        if low_cpu_mem_usage and is_peft_version("<=", "0.13.0"):
+            raise ValueError(
+                "`low_cpu_mem_usage=True` is not compatible with this `peft` version. Please update it with `pip install -U peft`."
+            )
 
         if use_safetensors is None:
             use_safetensors = True
             allow_pickle = True
 
-        user_agent = {
-            "file_type": "attn_procs_weights",
-            "framework": "pytorch",
-        }
+        user_agent = {"file_type": "attn_procs_weights", "framework": "pytorch"}
 
         model_file = None
         if not isinstance(pretrained_model_name_or_path_or_dict, dict):
@@ -199,16 +207,22 @@ class UNet2DConditionLoadersMixin:
         is_lora = all(("lora" in k or k.endswith(".alpha")) for k in state_dict.keys())
         is_model_cpu_offload = False
         is_sequential_cpu_offload = False
+        is_group_offload = False
+
+        if is_lora:
+            deprecation_message = "Using the `load_attn_procs()` method has been deprecated and will be removed in a future version. Please use `load_lora_adapter()`."
+            deprecate("load_attn_procs", "0.40.0", deprecation_message)
 
         if is_custom_diffusion:
             attn_processors = self._process_custom_diffusion(state_dict=state_dict)
         elif is_lora:
-            is_model_cpu_offload, is_sequential_cpu_offload = self._process_lora(
+            is_model_cpu_offload, is_sequential_cpu_offload, is_group_offload = self._process_lora(
                 state_dict=state_dict,
                 unet_identifier_key=self.unet_name,
                 network_alphas=network_alphas,
                 adapter_name=adapter_name,
                 _pipeline=_pipeline,
+                low_cpu_mem_usage=low_cpu_mem_usage,
             )
         else:
             raise ValueError(
@@ -221,7 +235,9 @@ class UNet2DConditionLoadersMixin:
 
         # For LoRA, the UNet is already offloaded at this stage as it is handled inside `_process_lora`.
         if is_custom_diffusion and _pipeline is not None:
-            is_model_cpu_offload, is_sequential_cpu_offload = self._optionally_disable_offloading(_pipeline=_pipeline)
+            is_model_cpu_offload, is_sequential_cpu_offload, is_group_offload = self._optionally_disable_offloading(
+                _pipeline=_pipeline
+            )
 
             # only custom diffusion needs to set attn processors
             self.set_attn_processor(attn_processors)
@@ -232,6 +248,10 @@ class UNet2DConditionLoadersMixin:
             _pipeline.enable_model_cpu_offload()
         elif is_sequential_cpu_offload:
             _pipeline.enable_sequential_cpu_offload()
+        elif is_group_offload:
+            for component in _pipeline.components.values():
+                if isinstance(component, torch.nn.Module):
+                    _maybe_remove_and_reapply_group_offloading(component)
         # Unsafe code />
 
     def _process_custom_diffusion(self, state_dict):
@@ -268,7 +288,9 @@ class UNet2DConditionLoadersMixin:
 
         return attn_processors
 
-    def _process_lora(self, state_dict, unet_identifier_key, network_alphas, adapter_name, _pipeline):
+    def _process_lora(
+        self, state_dict, unet_identifier_key, network_alphas, adapter_name, _pipeline, low_cpu_mem_usage
+    ):
         # This method does the following things:
         # 1. Filters the `state_dict` with keys matching  `unet_identifier_key` when using the non-legacy
         #    format. For legacy format no filtering is applied.
@@ -296,6 +318,7 @@ class UNet2DConditionLoadersMixin:
 
         is_model_cpu_offload = False
         is_sequential_cpu_offload = False
+        is_group_offload = False
         state_dict_to_be_used = unet_state_dict if len(unet_state_dict) > 0 else state_dict
 
         if len(state_dict_to_be_used) > 0:
@@ -326,6 +349,17 @@ class UNet2DConditionLoadersMixin:
                 else:
                     if is_peft_version("<", "0.9.0"):
                         lora_config_kwargs.pop("use_dora")
+
+            if "lora_bias" in lora_config_kwargs:
+                if lora_config_kwargs["lora_bias"]:
+                    if is_peft_version("<=", "0.13.2"):
+                        raise ValueError(
+                            "You need `peft` 0.14.0 at least to use `bias` in LoRAs. Please upgrade your installation of `peft`."
+                        )
+                else:
+                    if is_peft_version("<=", "0.13.2"):
+                        lora_config_kwargs.pop("lora_bias")
+
             lora_config = LoraConfig(**lora_config_kwargs)
 
             # adapter_name
@@ -334,61 +368,51 @@ class UNet2DConditionLoadersMixin:
 
             # In case the pipeline has been already offloaded to CPU - temporarily remove the hooks
             # otherwise loading LoRA weights will lead to an error
-            is_model_cpu_offload, is_sequential_cpu_offload = self._optionally_disable_offloading(_pipeline)
+            is_model_cpu_offload, is_sequential_cpu_offload, is_group_offload = self._optionally_disable_offloading(
+                _pipeline
+            )
+            peft_kwargs = {}
+            if is_peft_version(">=", "0.13.1"):
+                peft_kwargs["low_cpu_mem_usage"] = low_cpu_mem_usage
 
-            inject_adapter_in_model(lora_config, self, adapter_name=adapter_name)
-            incompatible_keys = set_peft_model_state_dict(self, state_dict, adapter_name)
+            inject_adapter_in_model(lora_config, self, adapter_name=adapter_name, **peft_kwargs)
+            incompatible_keys = set_peft_model_state_dict(self, state_dict, adapter_name, **peft_kwargs)
 
+            warn_msg = ""
             if incompatible_keys is not None:
-                # check only for unexpected keys
+                # Check only for unexpected keys.
                 unexpected_keys = getattr(incompatible_keys, "unexpected_keys", None)
                 if unexpected_keys:
-                    logger.warning(
-                        f"Loading adapter weights from state_dict led to unexpected keys not found in the model: "
-                        f" {unexpected_keys}. "
-                    )
+                    lora_unexpected_keys = [k for k in unexpected_keys if "lora_" in k and adapter_name in k]
+                    if lora_unexpected_keys:
+                        warn_msg = (
+                            f"Loading adapter weights from state_dict led to unexpected keys found in the model:"
+                            f" {', '.join(lora_unexpected_keys)}. "
+                        )
 
-        return is_model_cpu_offload, is_sequential_cpu_offload
+                # Filter missing keys specific to the current adapter.
+                missing_keys = getattr(incompatible_keys, "missing_keys", None)
+                if missing_keys:
+                    lora_missing_keys = [k for k in missing_keys if "lora_" in k and adapter_name in k]
+                    if lora_missing_keys:
+                        warn_msg += (
+                            f"Loading adapter weights from state_dict led to missing keys in the model:"
+                            f" {', '.join(lora_missing_keys)}."
+                        )
+
+            if warn_msg:
+                logger.warning(warn_msg)
+
+        return is_model_cpu_offload, is_sequential_cpu_offload, is_group_offload
 
     @classmethod
     # Copied from diffusers.loaders.lora_base.LoraBaseMixin._optionally_disable_offloading
     def _optionally_disable_offloading(cls, _pipeline):
-        """
-        Optionally removes offloading in case the pipeline has been already sequentially offloaded to CPU.
-
-        Args:
-            _pipeline (`DiffusionPipeline`):
-                The pipeline to disable offloading for.
-
-        Returns:
-            tuple:
-                A tuple indicating if `is_model_cpu_offload` or `is_sequential_cpu_offload` is True.
-        """
-        is_model_cpu_offload = False
-        is_sequential_cpu_offload = False
-
-        if _pipeline is not None and _pipeline.hf_device_map is None:
-            for _, component in _pipeline.components.items():
-                if isinstance(component, nn.Module) and hasattr(component, "_hf_hook"):
-                    if not is_model_cpu_offload:
-                        is_model_cpu_offload = isinstance(component._hf_hook, CpuOffload)
-                    if not is_sequential_cpu_offload:
-                        is_sequential_cpu_offload = (
-                            isinstance(component._hf_hook, AlignDevicesHook)
-                            or hasattr(component._hf_hook, "hooks")
-                            and isinstance(component._hf_hook.hooks[0], AlignDevicesHook)
-                        )
-
-                    logger.info(
-                        "Accelerate hooks detected. Since you have called `load_lora_weights()`, the previous hooks will be first removed. Then the LoRA parameters will be loaded and the hooks will be applied again."
-                    )
-                    remove_hook_from_module(component, recurse=is_sequential_cpu_offload)
-
-        return (is_model_cpu_offload, is_sequential_cpu_offload)
+        return _func_optionally_disable_offloading(_pipeline=_pipeline)
 
     def save_attn_procs(
         self,
-        save_directory: Union[str, os.PathLike],
+        save_directory: str | os.PathLike,
         is_main_process: bool = True,
         weight_name: str = None,
         save_function: Callable = None,
@@ -456,6 +480,9 @@ class UNet2DConditionLoadersMixin:
                     )
                 state_dict = {k: v for k, v in state_dict.items() if isinstance(v, torch.Tensor)}
         else:
+            deprecation_message = "Using the `save_attn_procs()` method has been deprecated and will be removed in a future version. Please use `save_lora_adapter()`."
+            deprecate("save_attn_procs", "0.40.0", deprecation_message)
+
             if not USE_PEFT_BACKEND:
                 raise ValueError("PEFT backend is required for saving LoRAs using the `save_attn_procs()` method.")
 
@@ -513,7 +540,7 @@ class UNet2DConditionLoadersMixin:
 
         return state_dict
 
-    def _convert_ip_adapter_image_proj_to_diffusers(self, state_dict, low_cpu_mem_usage=False):
+    def _convert_ip_adapter_image_proj_to_diffusers(self, state_dict, low_cpu_mem_usage=_LOW_CPU_MEM_USAGE_DEFAULT):
         if low_cpu_mem_usage:
             if is_accelerate_available():
                 from accelerate import init_empty_weights
@@ -726,14 +753,17 @@ class UNet2DConditionLoadersMixin:
         if not low_cpu_mem_usage:
             image_projection.load_state_dict(updated_state_dict, strict=True)
         else:
-            load_model_dict_into_meta(image_projection, updated_state_dict, device=self.device, dtype=self.dtype)
+            device_map = {"": self.device}
+            load_model_dict_into_meta(image_projection, updated_state_dict, device_map=device_map, dtype=self.dtype)
+            empty_device_cache()
 
         return image_projection
 
-    def _convert_ip_adapter_attn_to_diffusers(self, state_dicts, low_cpu_mem_usage=False):
+    def _convert_ip_adapter_attn_to_diffusers(self, state_dicts, low_cpu_mem_usage=_LOW_CPU_MEM_USAGE_DEFAULT):
         from ..models.attention_processor import (
             IPAdapterAttnProcessor,
             IPAdapterAttnProcessor2_0,
+            IPAdapterXFormersAttnProcessor,
         )
 
         if low_cpu_mem_usage:
@@ -773,11 +803,15 @@ class UNet2DConditionLoadersMixin:
             if cross_attention_dim is None or "motion_modules" in name:
                 attn_processor_class = self.attn_processors[name].__class__
                 attn_procs[name] = attn_processor_class()
-
             else:
-                attn_processor_class = (
-                    IPAdapterAttnProcessor2_0 if hasattr(F, "scaled_dot_product_attention") else IPAdapterAttnProcessor
-                )
+                if "XFormers" in str(self.attn_processors[name].__class__):
+                    attn_processor_class = IPAdapterXFormersAttnProcessor
+                else:
+                    attn_processor_class = (
+                        IPAdapterAttnProcessor2_0
+                        if hasattr(F, "scaled_dot_product_attention")
+                        else IPAdapterAttnProcessor
+                    )
                 num_image_text_embeds = []
                 for state_dict in state_dicts:
                     if "proj.weight" in state_dict["image_proj"]:
@@ -814,13 +848,16 @@ class UNet2DConditionLoadersMixin:
                 else:
                     device = next(iter(value_dict.values())).device
                     dtype = next(iter(value_dict.values())).dtype
-                    load_model_dict_into_meta(attn_procs[name], value_dict, device=device, dtype=dtype)
+                    device_map = {"": device}
+                    load_model_dict_into_meta(attn_procs[name], value_dict, device_map=device_map, dtype=dtype)
 
                 key_id += 2
 
+        empty_device_cache()
+
         return attn_procs
 
-    def _load_ip_adapter_weights(self, state_dicts, low_cpu_mem_usage=False):
+    def _load_ip_adapter_weights(self, state_dicts, low_cpu_mem_usage=_LOW_CPU_MEM_USAGE_DEFAULT):
         if not isinstance(state_dicts, list):
             state_dicts = [state_dicts]
 

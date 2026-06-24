@@ -1,4 +1,4 @@
-# Copyright 2024 the Latte Team and The HuggingFace Team.
+# Copyright 2025 the Latte Team and The HuggingFace Team.
 # All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -18,7 +18,7 @@ import inspect
 import re
 import urllib.parse as ul
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Optional, Tuple, Union
+from typing import Callable
 
 import torch
 from transformers import T5EncoderModel, T5Tokenizer
@@ -30,8 +30,10 @@ from ...schedulers import KarrasDiffusionSchedulers
 from ...utils import (
     BACKENDS_MAPPING,
     BaseOutput,
+    deprecate,
     is_bs4_available,
     is_ftfy_available,
+    is_torch_xla_available,
     logging,
     replace_example_docstring,
 )
@@ -39,7 +41,15 @@ from ...utils.torch_utils import is_compiled_module, randn_tensor
 from ...video_processor import VideoProcessor
 
 
+if is_torch_xla_available():
+    import torch_xla.core.xla_model as xm
+
+    XLA_AVAILABLE = True
+else:
+    XLA_AVAILABLE = False
+
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
+
 
 if is_bs4_available():
     from bs4 import BeautifulSoup
@@ -70,13 +80,13 @@ EXAMPLE_DOC_STRING = """
 # Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion.retrieve_timesteps
 def retrieve_timesteps(
     scheduler,
-    num_inference_steps: Optional[int] = None,
-    device: Optional[Union[str, torch.device]] = None,
-    timesteps: Optional[List[int]] = None,
-    sigmas: Optional[List[float]] = None,
+    num_inference_steps: int | None = None,
+    device: str | torch.device | None = None,
+    timesteps: list[int] | None = None,
+    sigmas: list[float] | None = None,
     **kwargs,
 ):
-    """
+    r"""
     Calls the scheduler's `set_timesteps` method and retrieves timesteps from the scheduler after the call. Handles
     custom timesteps. Any kwargs will be supplied to `scheduler.set_timesteps`.
 
@@ -88,15 +98,15 @@ def retrieve_timesteps(
             must be `None`.
         device (`str` or `torch.device`, *optional*):
             The device to which the timesteps should be moved to. If `None`, the timesteps are not moved.
-        timesteps (`List[int]`, *optional*):
+        timesteps (`list[int]`, *optional*):
             Custom timesteps used to override the timestep spacing strategy of the scheduler. If `timesteps` is passed,
             `num_inference_steps` and `sigmas` must be `None`.
-        sigmas (`List[float]`, *optional*):
+        sigmas (`list[float]`, *optional*):
             Custom sigmas used to override the timestep spacing strategy of the scheduler. If `sigmas` is passed,
             `num_inference_steps` and `timesteps` must be `None`.
 
     Returns:
-        `Tuple[torch.Tensor, int]`: A tuple where the first element is the timestep schedule from the scheduler and the
+        `tuple[torch.Tensor, int]`: A tuple where the first element is the timestep schedule from the scheduler and the
         second element is the number of inference steps.
     """
     if timesteps is not None and sigmas is not None:
@@ -180,7 +190,7 @@ class LattePipeline(DiffusionPipeline):
             tokenizer=tokenizer, text_encoder=text_encoder, vae=vae, transformer=transformer, scheduler=scheduler
         )
 
-        self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1)
+        self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1) if getattr(self, "vae", None) else 8
         self.video_processor = VideoProcessor(vae_scale_factor=self.vae_scale_factor)
 
     # Adapted from https://github.com/PixArt-alpha/PixArt-alpha/blob/master/diffusion/model/utils.py
@@ -195,13 +205,13 @@ class LattePipeline(DiffusionPipeline):
     # Adapted from diffusers.pipelines.deepfloyd_if.pipeline_if.encode_prompt
     def encode_prompt(
         self,
-        prompt: Union[str, List[str]],
+        prompt: str | list[str],
         do_classifier_free_guidance: bool = True,
         negative_prompt: str = "",
         num_images_per_prompt: int = 1,
-        device: Optional[torch.device] = None,
-        prompt_embeds: Optional[torch.FloatTensor] = None,
-        negative_prompt_embeds: Optional[torch.FloatTensor] = None,
+        device: torch.device | None = None,
+        prompt_embeds: torch.FloatTensor | None = None,
+        negative_prompt_embeds: torch.FloatTensor | None = None,
         clean_caption: bool = False,
         mask_feature: bool = True,
         dtype=None,
@@ -210,9 +220,9 @@ class LattePipeline(DiffusionPipeline):
         Encodes the prompt into text encoder hidden states.
 
         Args:
-            prompt (`str` or `List[str]`, *optional*):
+            prompt (`str` or `list[str]`, *optional*):
                 prompt to be encoded
-            negative_prompt (`str` or `List[str]`, *optional*):
+            negative_prompt (`str` or `list[str]`, *optional*):
                 The prompt not to guide the video generation. If not defined, one has to pass `negative_prompt_embeds`
                 instead. Ignored when not using guidance (i.e., ignored if `guidance_scale` is less than `1`). For
                 Latte, this should be "".
@@ -346,7 +356,7 @@ class LattePipeline(DiffusionPipeline):
     def prepare_extra_step_kwargs(self, generator, eta):
         # prepare extra kwargs for the scheduler step, since not all schedulers have the same signature
         # eta (η) is only used with the DDIMScheduler, it will be ignored for other schedulers.
-        # eta corresponds to η in DDIM paper: https://arxiv.org/abs/2010.02502
+        # eta corresponds to η in DDIM paper: https://huggingface.co/papers/2010.02502
         # and should be between [0, 1]
 
         accepts_eta = "eta" in set(inspect.signature(self.scheduler.step).parameters.keys())
@@ -491,7 +501,7 @@ class LattePipeline(DiffusionPipeline):
         # &amp
         caption = re.sub(r"&amp", "", caption)
 
-        # ip adresses:
+        # ip addresses:
         caption = re.sub(r"\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}", " ", caption)
 
         # article ids:
@@ -551,7 +561,7 @@ class LattePipeline(DiffusionPipeline):
 
         return caption.strip()
 
-    # Copied from diffusers.pipelines.text_to_video_synthesis.pipeline_text_to_video_synth.TextToVideoSDPipeline.prepare_latents
+    # Copied from diffusers.pipelines.deprecated.text_to_video_synthesis.pipeline_text_to_video_synth.TextToVideoSDPipeline.prepare_latents
     def prepare_latents(
         self, batch_size, num_channels_latents, num_frames, height, width, dtype, device, generator, latents=None
     ):
@@ -582,7 +592,7 @@ class LattePipeline(DiffusionPipeline):
         return self._guidance_scale
 
     # here `guidance_scale` is defined analog to the guidance weight `w` of equation (2)
-    # of the Imagen paper: https://arxiv.org/pdf/2205.11487.pdf . `guidance_scale = 1`
+    # of the Imagen paper: https://huggingface.co/papers/2205.11487 . `guidance_scale = 1`
     # corresponds to doing no classifier free guidance.
     @property
     def do_classifier_free_guidance(self):
@@ -593,6 +603,10 @@ class LattePipeline(DiffusionPipeline):
         return self._num_timesteps
 
     @property
+    def current_timestep(self):
+        return self._current_timestep
+
+    @property
     def interrupt(self):
         return self._interrupt
 
@@ -600,54 +614,52 @@ class LattePipeline(DiffusionPipeline):
     @replace_example_docstring(EXAMPLE_DOC_STRING)
     def __call__(
         self,
-        prompt: Union[str, List[str]] = None,
+        prompt: str | list[str] = None,
         negative_prompt: str = "",
         num_inference_steps: int = 50,
-        timesteps: Optional[List[int]] = None,
+        timesteps: list[int] | None = None,
         guidance_scale: float = 7.5,
         num_images_per_prompt: int = 1,
         video_length: int = 16,
         height: int = 512,
         width: int = 512,
         eta: float = 0.0,
-        generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
-        latents: Optional[torch.FloatTensor] = None,
-        prompt_embeds: Optional[torch.FloatTensor] = None,
-        negative_prompt_embeds: Optional[torch.FloatTensor] = None,
+        generator: torch.Generator | list[torch.Generator] | None = None,
+        latents: torch.FloatTensor | None = None,
+        prompt_embeds: torch.FloatTensor | None = None,
+        negative_prompt_embeds: torch.FloatTensor | None = None,
         output_type: str = "pil",
         return_dict: bool = True,
-        callback_on_step_end: Optional[
-            Union[Callable[[int, int, Dict], None], PipelineCallback, MultiPipelineCallbacks]
-        ] = None,
-        callback_on_step_end_tensor_inputs: List[str] = ["latents"],
+        callback_on_step_end: Callable[[int, int], None] | PipelineCallback | MultiPipelineCallbacks | None = None,
+        callback_on_step_end_tensor_inputs: list[str] = ["latents"],
         clean_caption: bool = True,
         mask_feature: bool = True,
         enable_temporal_attentions: bool = True,
-        decode_chunk_size: Optional[int] = None,
-    ) -> Union[LattePipelineOutput, Tuple]:
+        decode_chunk_size: int = 14,
+    ) -> LattePipelineOutput | tuple:
         """
         Function invoked when calling the pipeline for generation.
 
         Args:
-            prompt (`str` or `List[str]`, *optional*):
+            prompt (`str` or `list[str]`, *optional*):
                 The prompt or prompts to guide the video generation. If not defined, one has to pass `prompt_embeds`.
                 instead.
-            negative_prompt (`str` or `List[str]`, *optional*):
+            negative_prompt (`str` or `list[str]`, *optional*):
                 The prompt or prompts not to guide the video generation. If not defined, one has to pass
                 `negative_prompt_embeds` instead. Ignored when not using guidance (i.e., ignored if `guidance_scale` is
                 less than `1`).
             num_inference_steps (`int`, *optional*, defaults to 100):
                 The number of denoising steps. More denoising steps usually lead to a higher quality video at the
                 expense of slower inference.
-            timesteps (`List[int]`, *optional*):
+            timesteps (`list[int]`, *optional*):
                 Custom timesteps to use for the denoising process. If not defined, equal spaced `num_inference_steps`
                 timesteps are used. Must be in descending order.
             guidance_scale (`float`, *optional*, defaults to 7.0):
-                Guidance scale as defined in [Classifier-Free Diffusion Guidance](https://arxiv.org/abs/2207.12598).
-                `guidance_scale` is defined as `w` of equation 2. of [Imagen
-                Paper](https://arxiv.org/pdf/2205.11487.pdf). Guidance scale is enabled by setting `guidance_scale >
-                1`. Higher guidance scale encourages to generate videos that are closely linked to the text `prompt`,
-                usually at the expense of lower video quality.
+                Guidance scale as defined in [Classifier-Free Diffusion
+                Guidance](https://huggingface.co/papers/2207.12598). `guidance_scale` is defined as `w` of equation 2.
+                of [Imagen Paper](https://huggingface.co/papers/2205.11487). Guidance scale is enabled by setting
+                `guidance_scale > 1`. Higher guidance scale encourages to generate videos that are closely linked to
+                the text `prompt`, usually at the expense of lower video quality.
             video_length (`int`, *optional*, defaults to 16):
                 The number of video frames that are generated. Defaults to 16 frames which at 8 frames per seconds
             num_images_per_prompt (`int`, *optional*, defaults to 1):
@@ -657,15 +669,15 @@ class LattePipeline(DiffusionPipeline):
             width (`int`, *optional*, defaults to self.unet.config.sample_size):
                 The width in pixels of the generated video.
             eta (`float`, *optional*, defaults to 0.0):
-                Corresponds to parameter eta (η) in the DDIM paper: https://arxiv.org/abs/2010.02502. Only applies to
-                [`schedulers.DDIMScheduler`], will be ignored for others.
-            generator (`torch.Generator` or `List[torch.Generator]`, *optional*):
+                Corresponds to parameter eta (η) in the DDIM paper: https://huggingface.co/papers/2010.02502. Only
+                applies to [`schedulers.DDIMScheduler`], will be ignored for others.
+            generator (`torch.Generator` or `list[torch.Generator]`, *optional*):
                 One or a list of [torch generator(s)](https://pytorch.org/docs/stable/generated/torch.Generator.html)
                 to make generation deterministic.
             latents (`torch.FloatTensor`, *optional*):
                 Pre-generated noisy latents, sampled from a Gaussian distribution, to be used as inputs for video
                 generation. Can be used to tweak the same generation with different prompts. If not provided, a latents
-                tensor will ge generated by sampling using the supplied random `generator`.
+                tensor will be generated by sampling using the supplied random `generator`.
             prompt_embeds (`torch.FloatTensor`, *optional*):
                 Pre-generated text embeddings. Can be used to easily tweak text inputs, *e.g.* prompt weighting. If not
                 provided, text embeddings will be generated from `prompt` input argument.
@@ -677,9 +689,9 @@ class LattePipeline(DiffusionPipeline):
                 [PIL](https://pillow.readthedocs.io/en/stable/): `PIL.Image.Image` or `np.array`.
             return_dict (`bool`, *optional*, defaults to `True`):
                 Whether or not to return a [`~pipelines.stable_diffusion.IFPipelineOutput`] instead of a plain tuple.
-            callback_on_step_end (`Callable[[int, int, Dict], None]`, `PipelineCallback`, `MultiPipelineCallbacks`, *optional*):
+            callback_on_step_end (`Callable[[int, int], None]`, `PipelineCallback`, `MultiPipelineCallbacks`, *optional*):
                 A callback function or a list of callback functions to be called at the end of each denoising step.
-            callback_on_step_end_tensor_inputs (`List[str]`, *optional*):
+            callback_on_step_end_tensor_inputs (`list[str]`, *optional*):
                 A list of tensor inputs that should be passed to the callback function. If not defined, all tensor
                 inputs will be passed.
             clean_caption (`bool`, *optional*, defaults to `True`):
@@ -719,6 +731,7 @@ class LattePipeline(DiffusionPipeline):
             negative_prompt_embeds,
         )
         self._guidance_scale = guidance_scale
+        self._current_timestep = None
         self._interrupt = False
 
         # 2. Default height and width to transformer
@@ -732,7 +745,7 @@ class LattePipeline(DiffusionPipeline):
         device = self._execution_device
 
         # here `guidance_scale` is defined analog to the guidance weight `w` of equation (2)
-        # of the Imagen paper: https://arxiv.org/pdf/2205.11487.pdf . `guidance_scale = 1`
+        # of the Imagen paper: https://huggingface.co/papers/2205.11487 . `guidance_scale = 1`
         # corresponds to doing no classifier free guidance.
         do_classifier_free_guidance = guidance_scale > 1.0
 
@@ -752,7 +765,13 @@ class LattePipeline(DiffusionPipeline):
             prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds], dim=0)
 
         # 4. Prepare timesteps
-        timesteps, num_inference_steps = retrieve_timesteps(self.scheduler, num_inference_steps, device, timesteps)
+        if XLA_AVAILABLE:
+            timestep_device = "cpu"
+        else:
+            timestep_device = device
+        timesteps, num_inference_steps = retrieve_timesteps(
+            self.scheduler, num_inference_steps, timestep_device, timesteps
+        )
         self._num_timesteps = len(timesteps)
 
         # 5. Prepare latents.
@@ -780,6 +799,7 @@ class LattePipeline(DiffusionPipeline):
                 if self.interrupt:
                     continue
 
+                self._current_timestep = t
                 latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
                 latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
 
@@ -788,10 +808,11 @@ class LattePipeline(DiffusionPipeline):
                     # TODO: this requires sync between CPU and GPU. So try to pass timesteps as tensors if you can
                     # This would be a good case for the `match` statement (Python 3.10+)
                     is_mps = latent_model_input.device.type == "mps"
+                    is_npu = latent_model_input.device.type == "npu"
                     if isinstance(current_timestep, float):
-                        dtype = torch.float32 if is_mps else torch.float64
+                        dtype = torch.float32 if (is_mps or is_npu) else torch.float64
                     else:
-                        dtype = torch.int32 if is_mps else torch.int64
+                        dtype = torch.int32 if (is_mps or is_npu) else torch.int64
                     current_timestep = torch.tensor([current_timestep], dtype=dtype, device=latent_model_input.device)
                 elif len(current_timestep.shape) == 0:
                     current_timestep = current_timestep[None].to(latent_model_input.device)
@@ -800,7 +821,7 @@ class LattePipeline(DiffusionPipeline):
 
                 # predict noise model_output
                 noise_pred = self.transformer(
-                    latent_model_input,
+                    hidden_states=latent_model_input,
                     encoder_hidden_states=prompt_embeds,
                     timestep=current_timestep,
                     enable_temporal_attentions=enable_temporal_attentions,
@@ -836,8 +857,20 @@ class LattePipeline(DiffusionPipeline):
                 if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
                     progress_bar.update()
 
-        if not output_type == "latents":
-            video = self.decode_latents(latents, video_length, decode_chunk_size=14)
+                if XLA_AVAILABLE:
+                    xm.mark_step()
+
+        self._current_timestep = None
+
+        if output_type == "latents":
+            deprecation_message = (
+                "Passing `output_type='latents'` is deprecated. Please pass `output_type='latent'` instead."
+            )
+            deprecate("output_type_latents", "1.0.0", deprecation_message, standard_warn=False)
+            output_type = "latent"
+
+        if not output_type == "latent":
+            video = self.decode_latents(latents, video_length, decode_chunk_size=decode_chunk_size)
             video = self.video_processor.postprocess_video(video=video, output_type=output_type)
         else:
             video = latents

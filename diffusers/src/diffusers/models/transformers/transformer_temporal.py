@@ -1,4 +1,4 @@
-# Copyright 2024 The HuggingFace Team. All rights reserved.
+# Copyright 2025 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any
 
 import torch
 from torch import nn
@@ -67,24 +67,26 @@ class TransformerTemporalModel(ModelMixin, ConfigMixin):
             The maximum length of the sequence over which to apply positional embeddings.
     """
 
+    _skip_layerwise_casting_patterns = ["norm"]
+
     @register_to_config
     def __init__(
         self,
         num_attention_heads: int = 16,
         attention_head_dim: int = 88,
-        in_channels: Optional[int] = None,
-        out_channels: Optional[int] = None,
+        in_channels: int | None = None,
+        out_channels: int | None = None,
         num_layers: int = 1,
         dropout: float = 0.0,
         norm_num_groups: int = 32,
-        cross_attention_dim: Optional[int] = None,
+        cross_attention_dim: int | None = None,
         attention_bias: bool = False,
-        sample_size: Optional[int] = None,
+        sample_size: int | None = None,
         activation_fn: str = "geglu",
         norm_elementwise_affine: bool = True,
         double_self_attention: bool = True,
-        positional_embeddings: Optional[str] = None,
-        num_positional_embeddings: Optional[int] = None,
+        positional_embeddings: str | None = None,
+        num_positional_embeddings: int | None = None,
     ):
         super().__init__()
         self.num_attention_heads = num_attention_heads
@@ -121,11 +123,11 @@ class TransformerTemporalModel(ModelMixin, ConfigMixin):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        encoder_hidden_states: Optional[torch.LongTensor] = None,
-        timestep: Optional[torch.LongTensor] = None,
+        encoder_hidden_states: torch.LongTensor | None = None,
+        timestep: torch.LongTensor | None = None,
         class_labels: torch.LongTensor = None,
         num_frames: int = 1,
-        cross_attention_kwargs: Optional[Dict[str, Any]] = None,
+        cross_attention_kwargs: dict[str, Any] | None = None,
         return_dict: bool = True,
     ) -> TransformerTemporalModelOutput:
         """
@@ -220,9 +222,9 @@ class TransformerSpatioTemporalModel(nn.Module):
         num_attention_heads: int = 16,
         attention_head_dim: int = 88,
         in_channels: int = 320,
-        out_channels: Optional[int] = None,
+        out_channels: int | None = None,
         num_layers: int = 1,
-        cross_attention_dim: Optional[int] = None,
+        cross_attention_dim: int | None = None,
     ):
         super().__init__()
         self.num_attention_heads = num_attention_heads
@@ -278,8 +280,8 @@ class TransformerSpatioTemporalModel(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        encoder_hidden_states: Optional[torch.Tensor] = None,
-        image_only_indicator: Optional[torch.Tensor] = None,
+        encoder_hidden_states: torch.Tensor | None = None,
+        image_only_indicator: torch.Tensor | None = None,
         return_dict: bool = True,
     ):
         """
@@ -340,20 +342,12 @@ class TransformerSpatioTemporalModel(nn.Module):
 
         # 2. Blocks
         for block, temporal_block in zip(self.transformer_blocks, self.temporal_transformer_blocks):
-            if self.training and self.gradient_checkpointing:
-                hidden_states = torch.utils.checkpoint.checkpoint(
-                    block,
-                    hidden_states,
-                    None,
-                    encoder_hidden_states,
-                    None,
-                    use_reentrant=False,
+            if torch.is_grad_enabled() and self.gradient_checkpointing:
+                hidden_states = self._gradient_checkpointing_func(
+                    block, hidden_states, None, encoder_hidden_states, None
                 )
             else:
-                hidden_states = block(
-                    hidden_states,
-                    encoder_hidden_states=encoder_hidden_states,
-                )
+                hidden_states = block(hidden_states, encoder_hidden_states=encoder_hidden_states)
 
             hidden_states_mix = hidden_states
             hidden_states_mix = hidden_states_mix + emb

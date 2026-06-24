@@ -3,17 +3,35 @@ import copy
 import gc
 import math
 import random
-from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
+import re
+import warnings
+from contextlib import contextmanager
+from functools import partial
+from typing import Any, Iterable
 
 import numpy as np
 import torch
+import torch.nn.functional as F
+
+
+if torch.distributed.is_available():
+    from torch.distributed.fsdp import CPUOffload, ShardingStrategy
+    from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+    from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
+else:
+    CPUOffload = None
+    ShardingStrategy = None
+    FSDP = None
+    transformer_auto_wrap_policy = None
 
 from .models import UNet2DConditionModel
+from .pipelines import DiffusionPipeline
 from .schedulers import SchedulerMixin
 from .utils import (
     convert_state_dict_to_diffusers,
     convert_state_dict_to_peft,
     deprecate,
+    is_accelerate_available,
     is_peft_available,
     is_torch_npu_available,
     is_torchvision_available,
@@ -23,6 +41,12 @@ from .utils import (
 
 if is_transformers_available():
     import transformers
+
+    if transformers.integrations.deepspeed.is_deepspeed_zero3_enabled():
+        import deepspeed
+
+if is_accelerate_available():
+    from accelerate.logging import get_logger
 
 if is_peft_available():
     from peft import set_peft_model_state_dict
@@ -36,9 +60,13 @@ if is_torch_npu_available():
 
 def set_seed(seed: int):
     """
-    Args:
     Helper function for reproducible behavior to set the seed in `random`, `numpy`, `torch`.
+
+    Args:
         seed (`int`): The seed to set.
+
+    Returns:
+        `None`
     """
     random.seed(seed)
     np.random.seed(seed)
@@ -54,6 +82,17 @@ def compute_snr(noise_scheduler, timesteps):
     """
     Computes SNR as per
     https://github.com/TiankaiHang/Min-SNR-Diffusion-Training/blob/521b624bd70c67cee4bdf49225915f5945a872e3/guided_diffusion/gaussian_diffusion.py#L847-L849
+    for the given timesteps using the provided noise scheduler.
+
+    Args:
+        noise_scheduler (`NoiseScheduler`):
+            An object containing the noise schedule parameters, specifically `alphas_cumprod`, which is used to compute
+            the SNR values.
+        timesteps (`torch.Tensor`):
+            A tensor of timesteps for which the SNR is computed.
+
+    Returns:
+        `torch.Tensor`: A tensor containing the computed SNR values for each timestep.
     """
     alphas_cumprod = noise_scheduler.alphas_cumprod
     sqrt_alphas_cumprod = alphas_cumprod**0.5
@@ -74,6 +113,92 @@ def compute_snr(noise_scheduler, timesteps):
     # Compute SNR.
     snr = (alpha / sigma) ** 2
     return snr
+
+
+def compute_confidence_aware_loss(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    *,
+    lambda_conf: float = 0.0,
+    temperature: float = 1.0,
+    per_token_weights: torch.Tensor | None = None,
+    ignore_index: int = -100,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Computes a confidence-aware training loss for token classification-style heads.
+
+    This loss combines:
+      - `loss_sft`: standard supervised cross-entropy on all non-ignored labels.
+      - `loss_conf`: an entropy penalty applied only on tokens that are already predicted correctly.
+
+    Args:
+        logits (`torch.Tensor`): Logits of shape `(..., vocab_size)`.
+        labels (`torch.Tensor`): Labels of shape `(...)`, matching `logits.shape[:-1]`. Values set to `ignore_index`
+            are excluded from both losses.
+        lambda_conf (`float`, *optional*, defaults to `0.0`): Weight for the confidence term.
+        temperature (`float`, *optional*, defaults to `1.0`): Temperature used for the entropy term only. Lower values
+            sharpen the distribution and change the strength of the confidence gradients.
+        per_token_weights (`torch.Tensor`, *optional*): Optional weights of shape `(...)` to reweight both losses per
+            token (e.g. schedule-aware weights). Tokens with weight `0` contribute nothing.
+        ignore_index (`int`, *optional*, defaults to `-100`): Ignore index for labels.
+
+    Returns:
+        `Tuple[torch.Tensor, torch.Tensor, torch.Tensor]`: `(loss, loss_sft, loss_conf)`.
+    """
+    if logits.ndim < 2:
+        raise ValueError(f"`logits` must have at least 2 dims, got shape {tuple(logits.shape)}.")
+    if labels.shape != logits.shape[:-1]:
+        raise ValueError(
+            f"`labels` shape must match `logits.shape[:-1]`, got labels={tuple(labels.shape)} logits={tuple(logits.shape)}."
+        )
+    if temperature <= 0:
+        raise ValueError(f"`temperature` must be > 0, got {temperature}.")
+
+    valid = labels.ne(ignore_index)
+    if per_token_weights is None:
+        weights = torch.ones_like(labels, dtype=logits.dtype)
+    else:
+        if per_token_weights.shape != labels.shape:
+            raise ValueError(
+                f"`per_token_weights` shape must match `labels` shape, got {tuple(per_token_weights.shape)} != {tuple(labels.shape)}."
+            )
+        weights = per_token_weights.to(dtype=logits.dtype)
+
+    # Supervised CE (optionally weighted).
+    vocab_size = logits.shape[-1]
+    per_token_nll = F.cross_entropy(
+        logits.reshape(-1, vocab_size),
+        labels.reshape(-1),
+        reduction="none",
+        ignore_index=ignore_index,
+    ).reshape_as(labels)
+
+    denom_sft = (weights * valid.to(weights.dtype)).sum().clamp_min(1)
+    loss_sft = (per_token_nll * weights * valid.to(per_token_nll.dtype)).sum() / denom_sft
+
+    # Confidence loss: penalize entropy only where prediction is already correct.
+    if lambda_conf == 0.0:
+        loss_conf = torch.zeros((), device=logits.device, dtype=loss_sft.dtype)
+        return loss_sft, loss_sft, loss_conf
+
+    with torch.no_grad():
+        pred = logits.argmax(dim=-1)
+        correct = valid & pred.eq(labels)
+
+    scaled_logits = logits.float()
+    if temperature != 1.0:
+        scaled_logits = scaled_logits / float(temperature)
+
+    probs = torch.softmax(scaled_logits, dim=-1)
+    eps = torch.finfo(probs.dtype).tiny
+    log_probs = torch.log(probs.clamp_min(eps))
+    entropy = -(probs * log_probs).sum(dim=-1).to(dtype=logits.dtype)
+
+    denom_conf = (weights * correct.to(weights.dtype)).sum().clamp_min(1)
+    loss_conf = (entropy * weights * correct.to(entropy.dtype)).sum() / denom_conf
+
+    loss = loss_sft + float(lambda_conf) * loss_conf
+    return loss, loss_sft, loss_conf
 
 
 def resolve_interpolation_mode(interpolation_type: str):
@@ -129,11 +254,11 @@ def compute_dream_and_update_latents(
     target: torch.Tensor,
     encoder_hidden_states: torch.Tensor,
     dream_detail_preservation: float = 1.0,
-) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    Implements "DREAM (Diffusion Rectification and Estimation-Adaptive Models)" from http://arxiv.org/abs/2312.00210.
-    DREAM helps align training with sampling to help training be more efficient and accurate at the cost of an extra
-    forward step without gradients.
+    Implements "DREAM (Diffusion Rectification and Estimation-Adaptive Models)" from
+    https://huggingface.co/papers/2312.00210. DREAM helps align training with sampling to help training be more
+    efficient and accurate at the cost of an extra forward step without gradients.
 
     Args:
         `unet`: The state unet to use to make a prediction.
@@ -174,7 +299,7 @@ def compute_dream_and_update_latents(
     return _noisy_latents, _target
 
 
-def unet_lora_state_dict(unet: UNet2DConditionModel) -> Dict[str, torch.Tensor]:
+def unet_lora_state_dict(unet: UNet2DConditionModel) -> dict[str, torch.Tensor]:
     r"""
     Returns:
         A state dict containing just the LoRA parameters.
@@ -193,7 +318,14 @@ def unet_lora_state_dict(unet: UNet2DConditionModel) -> Dict[str, torch.Tensor]:
     return lora_state_dict
 
 
-def cast_training_params(model: Union[torch.nn.Module, List[torch.nn.Module]], dtype=torch.float32):
+def cast_training_params(model: torch.nn.Module | list[torch.nn.Module], dtype=torch.float32):
+    """
+    Casts the training parameters of the model to the specified data type.
+
+    Args:
+        model: The PyTorch model whose parameters will be cast.
+        dtype: The data type to which the model parameters will be cast.
+    """
     if not isinstance(model, list):
         model = [model]
     for m in model:
@@ -204,7 +336,7 @@ def cast_training_params(model: Union[torch.nn.Module, List[torch.nn.Module]], d
 
 
 def _set_state_dict_into_text_encoder(
-    lora_state_dict: Dict[str, torch.Tensor], prefix: str, text_encoder: torch.nn.Module
+    lora_state_dict: dict[str, torch.Tensor], prefix: str, text_encoder: torch.nn.Module
 ):
     """
     Sets the `lora_state_dict` into `text_encoder` coming from `transformers`.
@@ -216,39 +348,54 @@ def _set_state_dict_into_text_encoder(
     """
 
     text_encoder_state_dict = {
-        f'{k.replace(prefix, "")}': v for k, v in lora_state_dict.items() if k.startswith(prefix)
+        f"{k.replace(prefix, '')}": v for k, v in lora_state_dict.items() if k.startswith(prefix)
     }
     text_encoder_state_dict = convert_state_dict_to_peft(convert_state_dict_to_diffusers(text_encoder_state_dict))
     set_peft_model_state_dict(text_encoder, text_encoder_state_dict, adapter_name="default")
 
 
+def _collate_lora_metadata(modules_to_save: dict[str, torch.nn.Module]) -> dict[str, Any]:
+    metadatas = {}
+    for module_name, module in modules_to_save.items():
+        if module is not None:
+            metadatas[f"{module_name}_lora_adapter_metadata"] = module.peft_config["default"].to_dict()
+    return metadatas
+
+
 def compute_density_for_timestep_sampling(
-    weighting_scheme: str, batch_size: int, logit_mean: float = None, logit_std: float = None, mode_scale: float = None
+    weighting_scheme: str,
+    batch_size: int,
+    logit_mean: float = None,
+    logit_std: float = None,
+    mode_scale: float = None,
+    device: torch.device | str = "cpu",
+    generator: torch.Generator | None = None,
 ):
-    """Compute the density for sampling the timesteps when doing SD3 training.
+    """
+    Compute the density for sampling the timesteps when doing SD3 training.
 
     Courtesy: This was contributed by Rafie Walker in https://github.com/huggingface/diffusers/pull/8528.
 
-    SD3 paper reference: https://arxiv.org/abs/2403.03206v1.
+    SD3 paper reference: https://huggingface.co/papers/2403.03206v1.
     """
     if weighting_scheme == "logit_normal":
-        # See 3.1 in the SD3 paper ($rf/lognorm(0.00,1.00)$).
-        u = torch.normal(mean=logit_mean, std=logit_std, size=(batch_size,), device="cpu")
+        u = torch.normal(mean=logit_mean, std=logit_std, size=(batch_size,), device=device, generator=generator)
         u = torch.nn.functional.sigmoid(u)
     elif weighting_scheme == "mode":
-        u = torch.rand(size=(batch_size,), device="cpu")
+        u = torch.rand(size=(batch_size,), device=device, generator=generator)
         u = 1 - u - mode_scale * (torch.cos(math.pi * u / 2) ** 2 - 1 + u)
     else:
-        u = torch.rand(size=(batch_size,), device="cpu")
+        u = torch.rand(size=(batch_size,), device=device, generator=generator)
     return u
 
 
 def compute_loss_weighting_for_sd3(weighting_scheme: str, sigmas=None):
-    """Computes loss weighting scheme for SD3 training.
+    """
+    Computes loss weighting scheme for SD3 training.
 
     Courtesy: This was contributed by Rafie Walker in https://github.com/huggingface/diffusers/pull/8528.
 
-    SD3 paper reference: https://arxiv.org/abs/2403.03206v1.
+    SD3 paper reference: https://huggingface.co/papers/2403.03206v1.
     """
     if weighting_scheme == "sigma_sqrt":
         weighting = (sigmas**-2.0).float()
@@ -260,12 +407,10 @@ def compute_loss_weighting_for_sd3(weighting_scheme: str, sigmas=None):
     return weighting
 
 
-def clear_objs_and_retain_memory(objs: List[Any]):
-    """Deletes `objs` and runs garbage collection. Then clears the cache of the available accelerator."""
-    if len(objs) >= 1:
-        for obj in objs:
-            del obj
-
+def free_memory():
+    """
+    Runs garbage collection. Then clears the cache of the available accelerator.
+    """
     gc.collect()
 
     if torch.cuda.is_available():
@@ -273,7 +418,158 @@ def clear_objs_and_retain_memory(objs: List[Any]):
     elif torch.backends.mps.is_available():
         torch.mps.empty_cache()
     elif is_torch_npu_available():
-        torch_npu.empty_cache()
+        torch_npu.npu.empty_cache()
+    elif hasattr(torch, "xpu") and torch.xpu.is_available():
+        torch.xpu.empty_cache()
+
+
+@contextmanager
+def offload_models(*modules: torch.nn.Module | DiffusionPipeline, device: str | torch.device, offload: bool = True):
+    """
+    Context manager that, if offload=True, moves each module to `device` on enter, then moves it back to its original
+    device on exit.
+
+    Args:
+        device (`str` or `torch.Device`): Device to move the `modules` to.
+        offload (`bool`): Flag to enable offloading.
+    """
+    if offload:
+        is_model = not any(isinstance(m, DiffusionPipeline) for m in modules)
+        # record where each module was
+        if is_model:
+            original_devices = [next(m.parameters()).device for m in modules]
+        else:
+            assert len(modules) == 1
+            # For DiffusionPipeline, wrap the device in a list to make it iterable
+            original_devices = [modules[0].device]
+        # move to target device
+        for m in modules:
+            m.to(device)
+
+    try:
+        yield
+    finally:
+        if offload:
+            # move back to original devices
+            for m, orig_dev in zip(modules, original_devices):
+                m.to(orig_dev)
+
+
+def parse_buckets_string(buckets_str):
+    """Parses a string defining buckets into a list of (height, width) tuples."""
+    if not buckets_str:
+        raise ValueError("Bucket string cannot be empty.")
+
+    bucket_pairs = buckets_str.strip().split(";")
+    parsed_buckets = []
+    for pair_str in bucket_pairs:
+        match = re.match(r"^\s*(\d+)\s*,\s*(\d+)\s*$", pair_str)
+        if not match:
+            raise ValueError(f"Invalid bucket format: '{pair_str}'. Expected 'height,width'.")
+        try:
+            height = int(match.group(1))
+            width = int(match.group(2))
+            if height <= 0 or width <= 0:
+                raise ValueError("Bucket dimensions must be positive integers.")
+            if height % 8 != 0 or width % 8 != 0:
+                warnings.warn(f"Bucket dimension ({height},{width}) not divisible by 8. This might cause issues.")
+            parsed_buckets.append((height, width))
+        except ValueError as e:
+            raise ValueError(f"Invalid integer in bucket pair '{pair_str}': {e}") from e
+
+    if not parsed_buckets:
+        raise ValueError("No valid buckets found in the provided string.")
+
+    return parsed_buckets
+
+
+def find_nearest_bucket(h, w, bucket_options):
+    """Finds the closes bucket to the given height and width."""
+    min_metric = float("inf")
+    best_bucket_idx = None
+    for bucket_idx, (bucket_h, bucket_w) in enumerate(bucket_options):
+        metric = abs(h * bucket_w - w * bucket_h)
+        if metric <= min_metric:
+            min_metric = metric
+            best_bucket_idx = bucket_idx
+    return best_bucket_idx
+
+
+def _to_cpu_contiguous(state_dicts) -> dict:
+    return {k: v.detach().cpu().contiguous() if isinstance(v, torch.Tensor) else v for k, v in state_dicts.items()}
+
+
+def get_fsdp_kwargs_from_accelerator(accelerator) -> dict:
+    """
+    Extract and convert FSDP config from Accelerator into PyTorch FSDP kwargs.
+    """
+
+    kwargs = {}
+    fsdp_state = getattr(accelerator.state, "fsdp_plugin", None)
+
+    if fsdp_state is None:
+        raise ValueError("Accelerate isn't configured to handle FSDP. Please update your installation.")
+
+    fsdp_plugin = accelerator.state.fsdp_plugin
+
+    if fsdp_plugin is None:
+        # FSDP not enabled in Accelerator
+        kwargs["sharding_strategy"] = ShardingStrategy.FULL_SHARD
+    else:
+        # FSDP is enabled → use plugin's strategy, or default if None
+        kwargs["sharding_strategy"] = fsdp_plugin.sharding_strategy or ShardingStrategy.FULL_SHARD
+
+    return kwargs
+
+
+def wrap_with_fsdp(
+    model: torch.nn.Module,
+    device: str | torch.device,
+    offload: bool = True,
+    use_orig_params: bool = True,
+    limit_all_gathers: bool = True,
+    fsdp_kwargs: dict[str, Any] | None = None,
+    transformer_layer_cls: set[type[torch.nn.Module]] | None = None,
+) -> FSDP:
+    """
+    Wrap a model with FSDP using common defaults and optional transformer auto-wrapping.
+
+    Args:
+        model: Model to wrap
+        device: Target device (e.g., accelerator.device)
+        offload: Whether to enable CPU parameter offloading
+        use_orig_params: Whether to use original parameters
+        limit_all_gathers: Whether to limit all gathers
+        fsdp_kwargs: FSDP arguments (sharding_strategy, etc.) — usually from Accelerate config
+        transformer_layer_cls: Classes for auto-wrapping (if not using policy from fsdp_kwargs)
+
+    Returns:
+        FSDP-wrapped model
+    """
+
+    logger = get_logger(__name__)
+
+    if transformer_layer_cls is None:
+        # Set the default layers if transformer_layer_cls is not provided
+        transformer_layer_cls = type(model.model.language_model.layers[0])
+        logger.info(f"transformer_layer_cls is not provided, auto-inferred as {transformer_layer_cls.__name__}")
+
+    # Add auto-wrap policy if transformer layers specified
+    auto_wrap_policy = partial(transformer_auto_wrap_policy, transformer_layer_cls={transformer_layer_cls})
+
+    config = {
+        "device_id": device,
+        "cpu_offload": CPUOffload(offload_params=offload) if offload else None,
+        "use_orig_params": use_orig_params,
+        "limit_all_gathers": limit_all_gathers,
+        "auto_wrap_policy": auto_wrap_policy,
+    }
+
+    if fsdp_kwargs:
+        config.update(fsdp_kwargs)
+
+    fsdp_model = FSDP(model, **config)
+    return fsdp_model
 
 
 # Adapted from torch-ema https://github.com/fadel/pytorch_ema/blob/master/torch_ema/ema.py#L14
@@ -289,11 +585,11 @@ class EMAModel:
         min_decay: float = 0.0,
         update_after_step: int = 0,
         use_ema_warmup: bool = False,
-        inv_gamma: Union[float, int] = 1.0,
-        power: Union[float, int] = 2 / 3,
+        inv_gamma: float | int = 1.0,
+        power: float | int = 2 / 3,
         foreach: bool = False,
-        model_cls: Optional[Any] = None,
-        model_config: Dict[str, Any] = None,
+        model_cls: Any | None = None,
+        model_config: dict[str, Any] | None = None,
         **kwargs,
     ):
         """
@@ -307,7 +603,7 @@ class EMAModel:
                 Inverse multiplicative factor of EMA warmup. Default: 1. Only used if `use_ema_warmup` is True.
             power (float): Exponential factor of EMA warmup. Default: 2/3. Only used if `use_ema_warmup` is True.
             foreach (bool): Use torch._foreach functions for updating shadow parameters. Should be faster.
-            device (Optional[Union[str, torch.device]]): The device to store the EMA weights on. If None, the EMA
+            device (str | torch.device | None): The device to store the EMA weights on. If None, the EMA
                         weights will be stored on CPU.
 
         @crowsonkb's notes on EMA Warmup:
@@ -368,7 +664,7 @@ class EMAModel:
 
     @classmethod
     def from_pretrained(cls, path, model_cls, foreach=False) -> "EMAModel":
-        _, ema_kwargs = model_cls.load_config(path, return_unused_kwargs=True)
+        _, ema_kwargs = model_cls.from_config(path, return_unused_kwargs=True)
         model = model_cls.from_pretrained(path)
 
         ema_model = cls(model.parameters(), model_cls=model_cls, model_config=model.config, foreach=foreach)
@@ -434,15 +730,13 @@ class EMAModel:
         self.cur_decay_value = decay
         one_minus_decay = 1 - decay
 
-        context_manager = contextlib.nullcontext
-        if is_transformers_available() and transformers.integrations.deepspeed.is_deepspeed_zero3_enabled():
-            import deepspeed
+        context_manager = contextlib.nullcontext()
 
         if self.foreach:
             if is_transformers_available() and transformers.integrations.deepspeed.is_deepspeed_zero3_enabled():
                 context_manager = deepspeed.zero.GatheredParameters(parameters, modifier_rank=None)
 
-            with context_manager():
+            with context_manager:
                 params_grad = [param for param in parameters if param.requires_grad]
                 s_params_grad = [
                     s_param for s_param, param in zip(self.shadow_params, parameters) if param.requires_grad
@@ -464,7 +758,7 @@ class EMAModel:
                 if is_transformers_available() and transformers.integrations.deepspeed.is_deepspeed_zero3_enabled():
                     context_manager = deepspeed.zero.GatheredParameters(param, modifier_rank=None)
 
-                with context_manager():
+                with context_manager:
                     if param.requires_grad:
                         s_param.sub_(one_minus_decay * (s_param - param))
                     else:
@@ -498,7 +792,8 @@ class EMAModel:
         self.shadow_params = [p.pin_memory() for p in self.shadow_params]
 
     def to(self, device=None, dtype=None, non_blocking=False) -> None:
-        r"""Move internal buffers of the ExponentialMovingAverage to `device`.
+        r"""
+        Move internal buffers of the ExponentialMovingAverage to `device`.
 
         Args:
             device: like `device` argument to `torch.Tensor.to`
@@ -532,25 +827,27 @@ class EMAModel:
 
     def store(self, parameters: Iterable[torch.nn.Parameter]) -> None:
         r"""
+        Saves the current parameters for restoring later.
+
         Args:
-        Save the current parameters for restoring later.
-            parameters: Iterable of `torch.nn.Parameter`; the parameters to be
-                temporarily stored.
+            parameters: Iterable of `torch.nn.Parameter`. The parameters to be temporarily stored.
         """
         self.temp_stored_params = [param.detach().cpu().clone() for param in parameters]
 
     def restore(self, parameters: Iterable[torch.nn.Parameter]) -> None:
         r"""
-        Args:
-        Restore the parameters stored with the `store` method. Useful to validate the model with EMA parameters without:
-        affecting the original optimization process. Store the parameters before the `copy_to()` method. After
+        Restore the parameters stored with the `store` method. Useful to validate the model with EMA parameters
+        without: affecting the original optimization process. Store the parameters before the `copy_to()` method. After
         validation (or model saving), use this to restore the former parameters.
+
+        Args:
             parameters: Iterable of `torch.nn.Parameter`; the parameters to be
                 updated with the stored parameters. If `None`, the parameters with which this
                 `ExponentialMovingAverage` was initialized will be used.
         """
+
         if self.temp_stored_params is None:
-            raise RuntimeError("This ExponentialMovingAverage has no `store()`ed weights " "to `restore()`")
+            raise RuntimeError("This ExponentialMovingAverage has no `store()`ed weights to `restore()`")
         if self.foreach:
             torch._foreach_copy_(
                 [param.data for param in parameters], [c_param.data for c_param in self.temp_stored_params]
@@ -564,9 +861,10 @@ class EMAModel:
 
     def load_state_dict(self, state_dict: dict) -> None:
         r"""
-        Args:
         Loads the ExponentialMovingAverage state. This method is used by accelerate during checkpointing to save the
         ema state dict.
+
+        Args:
             state_dict (dict): EMA state. Should be an object returned
                 from a call to :meth:`state_dict`.
         """

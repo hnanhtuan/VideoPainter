@@ -5,9 +5,9 @@ from ...utils import (
     OptionalDependencyNotAvailable,
     _LazyModule,
     get_objects_from_module,
-    is_flax_available,
     is_torch_available,
     is_transformers_available,
+    is_transformers_flax_compatible,
 )
 
 
@@ -30,8 +30,11 @@ else:
     _import_structure["pipeline_controlnet_inpaint_sd_xl"] = ["StableDiffusionXLControlNetInpaintPipeline"]
     _import_structure["pipeline_controlnet_sd_xl"] = ["StableDiffusionXLControlNetPipeline"]
     _import_structure["pipeline_controlnet_sd_xl_img2img"] = ["StableDiffusionXLControlNetImg2ImgPipeline"]
+    _import_structure["pipeline_controlnet_union_inpaint_sd_xl"] = ["StableDiffusionXLControlNetUnionInpaintPipeline"]
+    _import_structure["pipeline_controlnet_union_sd_xl"] = ["StableDiffusionXLControlNetUnionPipeline"]
+    _import_structure["pipeline_controlnet_union_sd_xl_img2img"] = ["StableDiffusionXLControlNetUnionImg2ImgPipeline"]
 try:
-    if not (is_transformers_available() and is_flax_available()):
+    if not is_transformers_flax_compatible():
         raise OptionalDependencyNotAvailable()
 except OptionalDependencyNotAvailable:
     from ...utils import dummy_flax_and_transformers_objects  # noqa F403
@@ -57,9 +60,12 @@ if TYPE_CHECKING or DIFFUSERS_SLOW_IMPORT:
         from .pipeline_controlnet_inpaint_sd_xl import StableDiffusionXLControlNetInpaintPipeline
         from .pipeline_controlnet_sd_xl import StableDiffusionXLControlNetPipeline
         from .pipeline_controlnet_sd_xl_img2img import StableDiffusionXLControlNetImg2ImgPipeline
+        from .pipeline_controlnet_union_inpaint_sd_xl import StableDiffusionXLControlNetUnionInpaintPipeline
+        from .pipeline_controlnet_union_sd_xl import StableDiffusionXLControlNetUnionPipeline
+        from .pipeline_controlnet_union_sd_xl_img2img import StableDiffusionXLControlNetUnionImg2ImgPipeline
 
     try:
-        if not (is_transformers_available() and is_flax_available()):
+        if not is_transformers_flax_compatible():
             raise OptionalDependencyNotAvailable()
     except OptionalDependencyNotAvailable:
         from ...utils.dummy_flax_and_transformers_objects import *  # noqa F403

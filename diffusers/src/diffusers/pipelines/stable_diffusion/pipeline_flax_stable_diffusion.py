@@ -1,4 +1,4 @@
-# Copyright 2024 The HuggingFace Team. All rights reserved.
+# Copyright 2025 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,7 +14,6 @@
 
 import warnings
 from functools import partial
-from typing import Dict, List, Optional, Union
 
 import jax
 import jax.numpy as jnp
@@ -55,7 +54,7 @@ EXAMPLE_DOC_STRING = """
         >>> from diffusers import FlaxStableDiffusionPipeline
 
         >>> pipeline, params = FlaxStableDiffusionPipeline.from_pretrained(
-        ...     "runwayml/stable-diffusion-v1-5", variant="bf16", dtype=jax.numpy.bfloat16
+        ...     "stable-diffusion-v1-5/stable-diffusion-v1-5", variant="bf16", dtype=jax.numpy.bfloat16
         ... )
 
         >>> prompt = "a photo of an astronaut riding a horse on mars"
@@ -100,8 +99,8 @@ class FlaxStableDiffusionPipeline(FlaxDiffusionPipeline):
             [`FlaxDPMSolverMultistepScheduler`].
         safety_checker ([`FlaxStableDiffusionSafetyChecker`]):
             Classification module that estimates whether generated images could be considered offensive or harmful.
-            Please refer to the [model card](https://huggingface.co/runwayml/stable-diffusion-v1-5) for more details
-            about a model's potential harms.
+            Please refer to the [model card](https://huggingface.co/stable-diffusion-v1-5/stable-diffusion-v1-5) for
+            more details about a model's potential harms.
         feature_extractor ([`~transformers.CLIPImageProcessor`]):
             A `CLIPImageProcessor` to extract features from generated images; used as inputs to the `safety_checker`.
     """
@@ -112,9 +111,7 @@ class FlaxStableDiffusionPipeline(FlaxDiffusionPipeline):
         text_encoder: FlaxCLIPTextModel,
         tokenizer: CLIPTokenizer,
         unet: FlaxUNet2DConditionModel,
-        scheduler: Union[
-            FlaxDDIMScheduler, FlaxPNDMScheduler, FlaxLMSDiscreteScheduler, FlaxDPMSolverMultistepScheduler
-        ],
+        scheduler: FlaxDDIMScheduler | FlaxPNDMScheduler | FlaxLMSDiscreteScheduler | FlaxDPMSolverMultistepScheduler,
         safety_checker: FlaxStableDiffusionSafetyChecker,
         feature_extractor: CLIPImageProcessor,
         dtype: jnp.dtype = jnp.float32,
@@ -132,17 +129,21 @@ class FlaxStableDiffusionPipeline(FlaxDiffusionPipeline):
                 " information, please have a look at https://github.com/huggingface/diffusers/pull/254 ."
             )
 
-        is_unet_version_less_0_9_0 = hasattr(unet.config, "_diffusers_version") and version.parse(
-            version.parse(unet.config._diffusers_version).base_version
-        ) < version.parse("0.9.0.dev0")
-        is_unet_sample_size_less_64 = hasattr(unet.config, "sample_size") and unet.config.sample_size < 64
+        is_unet_version_less_0_9_0 = (
+            unet is not None
+            and hasattr(unet.config, "_diffusers_version")
+            and version.parse(version.parse(unet.config._diffusers_version).base_version) < version.parse("0.9.0.dev0")
+        )
+        is_unet_sample_size_less_64 = (
+            unet is not None and hasattr(unet.config, "sample_size") and unet.config.sample_size < 64
+        )
         if is_unet_version_less_0_9_0 and is_unet_sample_size_less_64:
             deprecation_message = (
                 "The configuration file of the unet has set the default `sample_size` to smaller than"
                 " 64 which seems highly unlikely .If you're checkpoint is a fine-tuned version of any of the"
                 " following: \n- CompVis/stable-diffusion-v1-4 \n- CompVis/stable-diffusion-v1-3 \n-"
-                " CompVis/stable-diffusion-v1-2 \n- CompVis/stable-diffusion-v1-1 \n- runwayml/stable-diffusion-v1-5"
-                " \n- runwayml/stable-diffusion-inpainting \n you should change 'sample_size' to 64 in the"
+                " CompVis/stable-diffusion-v1-2 \n- CompVis/stable-diffusion-v1-1 \n- stable-diffusion-v1-5/stable-diffusion-v1-5"
+                " \n- stable-diffusion-v1-5/stable-diffusion-inpainting \n you should change 'sample_size' to 64 in the"
                 " configuration file. Please make sure to update the config accordingly as leaving `sample_size=32`"
                 " in the config might lead to incorrect results in future versions. If you have downloaded this"
                 " checkpoint from the Hugging Face Hub, it would be very nice if you could open a Pull request for"
@@ -162,9 +163,9 @@ class FlaxStableDiffusionPipeline(FlaxDiffusionPipeline):
             safety_checker=safety_checker,
             feature_extractor=feature_extractor,
         )
-        self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1)
+        self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1) if getattr(self, "vae", None) else 8
 
-    def prepare_inputs(self, prompt: Union[str, List[str]]):
+    def prepare_inputs(self, prompt: str | list[str]):
         if not isinstance(prompt, (str, list)):
             raise ValueError(f"`prompt` has to be of type `str` or `list` but is {type(prompt)}")
 
@@ -214,14 +215,14 @@ class FlaxStableDiffusionPipeline(FlaxDiffusionPipeline):
     def _generate(
         self,
         prompt_ids: jnp.array,
-        params: Union[Dict, FrozenDict],
+        params: dict | FrozenDict,
         prng_seed: jax.Array,
         num_inference_steps: int,
         height: int,
         width: int,
         guidance_scale: float,
-        latents: Optional[jnp.ndarray] = None,
-        neg_prompt_ids: Optional[jnp.ndarray] = None,
+        latents: jnp.ndarray | None = None,
+        neg_prompt_ids: jnp.ndarray | None = None,
     ):
         if height % 8 != 0 or width % 8 != 0:
             raise ValueError(f"`height` and `width` have to be divisible by 8 but are {height} and {width}.")
@@ -311,12 +312,12 @@ class FlaxStableDiffusionPipeline(FlaxDiffusionPipeline):
     def __call__(
         self,
         prompt_ids: jnp.array,
-        params: Union[Dict, FrozenDict],
+        params: dict | FrozenDict,
         prng_seed: jax.Array,
         num_inference_steps: int = 50,
-        height: Optional[int] = None,
-        width: Optional[int] = None,
-        guidance_scale: Union[float, jnp.ndarray] = 7.5,
+        height: int | None = None,
+        width: int | None = None,
+        guidance_scale: float | jnp.ndarray = 7.5,
         latents: jnp.ndarray = None,
         neg_prompt_ids: jnp.ndarray = None,
         return_dict: bool = True,
@@ -326,7 +327,7 @@ class FlaxStableDiffusionPipeline(FlaxDiffusionPipeline):
         The call function to the pipeline for generation.
 
         Args:
-            prompt (`str` or `List[str]`, *optional*):
+            prompt (`str` or `list[str]`, *optional*):
                 The prompt or prompts to guide image generation.
             height (`int`, *optional*, defaults to `self.unet.config.sample_size * self.vae_scale_factor`):
                 The height in pixels of the generated image.
@@ -345,12 +346,8 @@ class FlaxStableDiffusionPipeline(FlaxDiffusionPipeline):
             jit (`bool`, defaults to `False`):
                 Whether to run `pmap` versions of the generation and safety scoring functions.
 
-                    <Tip warning={true}>
-
-                    This argument exists because `__call__` is not yet end-to-end pmap-able. It will be removed in a
-                    future release.
-
-                    </Tip>
+                    > [!WARNING] > This argument exists because `__call__` is not yet end-to-end pmap-able. It will be
+                    removed in a > future release.
 
             return_dict (`bool`, *optional*, defaults to `True`):
                 Whether or not to return a [`~pipelines.stable_diffusion.FlaxStableDiffusionPipelineOutput`] instead of

@@ -1,4 +1,4 @@
-# Copyright 2024 The HuggingFace Team. All rights reserved.
+# Copyright 2025 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,13 +12,26 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import List, Optional, Tuple, Union
+import logging
 
 import torch
 
+from ...models import UNet2DModel
 from ...schedulers import DDIMScheduler
+from ...utils import is_torch_xla_available
 from ...utils.torch_utils import randn_tensor
 from ..pipeline_utils import DiffusionPipeline, ImagePipelineOutput
+
+
+logger = logging.getLogger(__name__)
+
+
+if is_torch_xla_available():
+    import torch_xla.core.xla_model as xm
+
+    XLA_AVAILABLE = True
+else:
+    XLA_AVAILABLE = False
 
 
 class DDIMPipeline(DiffusionPipeline):
@@ -38,7 +51,7 @@ class DDIMPipeline(DiffusionPipeline):
 
     model_cpu_offload_seq = "unet"
 
-    def __init__(self, unet, scheduler):
+    def __init__(self, unet: UNet2DModel, scheduler: DDIMScheduler):
         super().__init__()
 
         # make sure scheduler can always be converted to DDIM
@@ -50,13 +63,13 @@ class DDIMPipeline(DiffusionPipeline):
     def __call__(
         self,
         batch_size: int = 1,
-        generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
+        generator: torch.Generator | list[torch.Generator] | None = None,
         eta: float = 0.0,
         num_inference_steps: int = 50,
-        use_clipped_model_output: Optional[bool] = None,
-        output_type: Optional[str] = "pil",
+        use_clipped_model_output: bool | None = None,
+        output_type: str | None = "pil",
         return_dict: bool = True,
-    ) -> Union[ImagePipelineOutput, Tuple]:
+    ) -> ImagePipelineOutput | tuple:
         r"""
         The call function to the pipeline for generation.
 
@@ -67,9 +80,9 @@ class DDIMPipeline(DiffusionPipeline):
                 A [`torch.Generator`](https://pytorch.org/docs/stable/generated/torch.Generator.html) to make
                 generation deterministic.
             eta (`float`, *optional*, defaults to 0.0):
-                Corresponds to parameter eta (η) from the [DDIM](https://arxiv.org/abs/2010.02502) paper. Only applies
-                to the [`~schedulers.DDIMScheduler`], and is ignored in other schedulers. A value of `0` corresponds to
-                DDIM and `1` corresponds to DDPM.
+                Corresponds to parameter eta (η) from the [DDIM](https://huggingface.co/papers/2010.02502) paper. Only
+                applies to the [`~schedulers.DDIMScheduler`], and is ignored in other schedulers. A value of `0`
+                corresponds to DDIM and `1` corresponds to DDPM.
             num_inference_steps (`int`, *optional*, defaults to 50):
                 The number of denoising steps. More denoising steps usually lead to a higher quality image at the
                 expense of slower inference.
@@ -121,6 +134,13 @@ class DDIMPipeline(DiffusionPipeline):
         else:
             image_shape = (batch_size, self.unet.config.in_channels, *self.unet.config.sample_size)
 
+        if not 0.0 <= eta <= 1.0:
+            logger.warning(
+                f"`eta` should be between 0 and 1 (inclusive), but received {eta}. "
+                "A value of 0 corresponds to DDIM and 1 corresponds to DDPM. "
+                "Unexpected results may occur for values outside this range."
+            )
+
         if isinstance(generator, list) and len(generator) != batch_size:
             raise ValueError(
                 f"You have passed a list of generators of length {len(generator)}, but requested an effective batch"
@@ -142,6 +162,9 @@ class DDIMPipeline(DiffusionPipeline):
             image = self.scheduler.step(
                 model_output, t, image, eta=eta, use_clipped_model_output=use_clipped_model_output, generator=generator
             ).prev_sample
+
+            if XLA_AVAILABLE:
+                xm.mark_step()
 
         image = (image / 2 + 0.5).clamp(0, 1)
         image = image.cpu().permute(0, 2, 3, 1).numpy()

@@ -1,17 +1,18 @@
 import os
 import tempfile
-from typing import Callable, List, Optional, Union
+from typing import Any, Callable
 from urllib.parse import unquote, urlparse
 
 import PIL.Image
 import PIL.ImageOps
 import requests
 
+from .constants import DIFFUSERS_REQUEST_TIMEOUT
 from .import_utils import BACKENDS_MAPPING, is_imageio_available
 
 
 def load_image(
-    image: Union[str, PIL.Image.Image], convert_method: Optional[Callable[[PIL.Image.Image], PIL.Image.Image]] = None
+    image: str | PIL.Image.Image, convert_method: Callable[[PIL.Image.Image], PIL.Image.Image] | None = None
 ) -> PIL.Image.Image:
     """
     Loads `image` to a PIL Image.
@@ -29,7 +30,7 @@ def load_image(
     """
     if isinstance(image, str):
         if image.startswith("http://") or image.startswith("https://"):
-            image = PIL.Image.open(requests.get(image, stream=True).raw)
+            image = PIL.Image.open(requests.get(image, stream=True, timeout=DIFFUSERS_REQUEST_TIMEOUT).raw)
         elif os.path.isfile(image):
             image = PIL.Image.open(image)
         else:
@@ -55,20 +56,20 @@ def load_image(
 
 def load_video(
     video: str,
-    convert_method: Optional[Callable[[List[PIL.Image.Image]], List[PIL.Image.Image]]] = None,
-) -> List[PIL.Image.Image]:
+    convert_method: Callable[[list[PIL.Image.Image]], list[PIL.Image.Image]] | None = None,
+) -> list[PIL.Image.Image]:
     """
     Loads `video` to a list of PIL Image.
 
     Args:
         video (`str`):
             A URL or Path to a video to convert to a list of PIL Image format.
-        convert_method (Callable[[List[PIL.Image.Image]], List[PIL.Image.Image]], *optional*):
+        convert_method (Callable[[list[PIL.Image.Image]], list[PIL.Image.Image]], *optional*):
             A conversion method to apply to the video after loading it. When set to `None` the images will be converted
             to "RGB".
 
     Returns:
-        `List[PIL.Image.Image]`:
+        `list[PIL.Image.Image]`:
             The video as a list of PIL images.
     """
     is_url = video.startswith("http://") or video.startswith("https://")
@@ -135,3 +136,28 @@ def load_video(
         pil_images = convert_method(pil_images)
 
     return pil_images
+
+
+# Taken from `transformers`.
+def get_module_from_name(module, tensor_name: str) -> tuple[Any, str]:
+    if "." in tensor_name:
+        splits = tensor_name.split(".")
+        for split in splits[:-1]:
+            new_module = getattr(module, split)
+            if new_module is None:
+                raise ValueError(f"{module} has no attribute {split}.")
+            module = new_module
+        tensor_name = splits[-1]
+    return module, tensor_name
+
+
+def get_submodule_by_name(root_module, module_path: str):
+    current = root_module
+    parts = module_path.split(".")
+    for part in parts:
+        if part.isdigit():
+            idx = int(part)
+            current = current[idx]  # e.g., for nn.ModuleList or nn.Sequential
+        else:
+            current = getattr(current, part)
+    return current

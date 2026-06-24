@@ -1,4 +1,4 @@
-# Copyright 2024 HunyuanDiT Authors and The HuggingFace Team. All rights reserved.
+# Copyright 2025 HunyuanDiT Authors and The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,11 +13,11 @@
 # limitations under the License.
 
 import inspect
-from typing import Callable, Dict, List, Optional, Tuple, Union
+from typing import Callable
 
 import numpy as np
 import torch
-from transformers import BertModel, BertTokenizer, CLIPImageProcessor, MT5Tokenizer, T5EncoderModel
+from transformers import BertModel, BertTokenizer, CLIPImageProcessor, T5EncoderModel, T5Tokenizer
 
 from diffusers.pipelines.stable_diffusion import StableDiffusionPipelineOutput
 
@@ -27,11 +27,7 @@ from ...models import AutoencoderKL, HunyuanDiT2DControlNetModel, HunyuanDiT2DMo
 from ...models.embeddings import get_2d_rotary_pos_embed
 from ...pipelines.stable_diffusion.safety_checker import StableDiffusionSafetyChecker
 from ...schedulers import DDPMScheduler
-from ...utils import (
-    is_torch_xla_available,
-    logging,
-    replace_example_docstring,
-)
+from ...utils import is_torch_xla_available, logging, replace_example_docstring
 from ...utils.torch_utils import randn_tensor
 from ..pipeline_utils import DiffusionPipeline
 
@@ -141,9 +137,21 @@ def get_resize_crop_region_for_grid(src, tgt_size):
 
 # Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion.rescale_noise_cfg
 def rescale_noise_cfg(noise_cfg, noise_pred_text, guidance_rescale=0.0):
-    """
-    Rescale `noise_cfg` according to `guidance_rescale`. Based on findings of [Common Diffusion Noise Schedules and
-    Sample Steps are Flawed](https://arxiv.org/pdf/2305.08891.pdf). See Section 3.4
+    r"""
+    Rescales `noise_cfg` tensor based on `guidance_rescale` to improve image quality and fix overexposure. Based on
+    Section 3.4 from [Common Diffusion Noise Schedules and Sample Steps are
+    Flawed](https://huggingface.co/papers/2305.08891).
+
+    Args:
+        noise_cfg (`torch.Tensor`):
+            The predicted noise tensor for the guided diffusion process.
+        noise_pred_text (`torch.Tensor`):
+            The predicted noise tensor for the text-guided diffusion process.
+        guidance_rescale (`float`, *optional*, defaults to 0.0):
+            A rescale factor applied to the noise predictions.
+
+    Returns:
+        noise_cfg (`torch.Tensor`): The rescaled noise prediction tensor.
     """
     std_text = noise_pred_text.std(dim=list(range(1, noise_pred_text.ndim)), keepdim=True)
     std_cfg = noise_cfg.std(dim=list(range(1, noise_cfg.ndim)), keepdim=True)
@@ -168,20 +176,20 @@ class HunyuanDiTControlNetPipeline(DiffusionPipeline):
         vae ([`AutoencoderKL`]):
             Variational Auto-Encoder (VAE) Model to encode and decode images to and from latent representations. We use
             `sdxl-vae-fp16-fix`.
-        text_encoder (Optional[`~transformers.BertModel`, `~transformers.CLIPTextModel`]):
+        text_encoder (`~transformers.BertModel`, `~transformers.CLIPTextModel` | None):
             Frozen text-encoder ([clip-vit-large-patch14](https://huggingface.co/openai/clip-vit-large-patch14)).
             HunyuanDiT uses a fine-tuned [bilingual CLIP].
-        tokenizer (Optional[`~transformers.BertTokenizer`, `~transformers.CLIPTokenizer`]):
+        tokenizer (`~transformers.BertTokenizer`, `~transformers.CLIPTokenizer` | None):
             A `BertTokenizer` or `CLIPTokenizer` to tokenize text.
         transformer ([`HunyuanDiT2DModel`]):
             The HunyuanDiT model designed by Tencent Hunyuan.
         text_encoder_2 (`T5EncoderModel`):
             The mT5 embedder. Specifically, it is 't5-v1_1-xxl'.
-        tokenizer_2 (`MT5Tokenizer`):
+        tokenizer_2 (`T5Tokenizer`):
             The tokenizer for the mT5 embedder.
         scheduler ([`DDPMScheduler`]):
             A scheduler to be used in combination with HunyuanDiT to denoise the encoded image latents.
-        controlnet ([`HunyuanDiT2DControlNetModel`] or `List[HunyuanDiT2DControlNetModel]` or [`HunyuanDiT2DControlNetModel`]):
+        controlnet ([`HunyuanDiT2DControlNetModel`] or `list[HunyuanDiT2DControlNetModel]` or [`HunyuanDiT2DControlNetModel`]):
             Provides additional conditioning to the `unet` during the denoising process. If you set multiple
             ControlNets as a list, the outputs from each ControlNet are added together to create one combined
             additional conditioning.
@@ -214,17 +222,17 @@ class HunyuanDiTControlNetPipeline(DiffusionPipeline):
         scheduler: DDPMScheduler,
         safety_checker: StableDiffusionSafetyChecker,
         feature_extractor: CLIPImageProcessor,
-        controlnet: Union[
-            HunyuanDiT2DControlNetModel,
-            List[HunyuanDiT2DControlNetModel],
-            Tuple[HunyuanDiT2DControlNetModel],
-            HunyuanDiT2DMultiControlNetModel,
-        ],
-        text_encoder_2=T5EncoderModel,
-        tokenizer_2=MT5Tokenizer,
+        controlnet: HunyuanDiT2DControlNetModel
+        | list[HunyuanDiT2DControlNetModel]
+        | tuple[HunyuanDiT2DControlNetModel]
+        | HunyuanDiT2DMultiControlNetModel,
+        text_encoder_2: T5EncoderModel | None = None,
+        tokenizer_2: T5Tokenizer | None = None,
         requires_safety_checker: bool = True,
     ):
         super().__init__()
+        if isinstance(controlnet, (list, tuple)):
+            controlnet = HunyuanDiT2DMultiControlNetModel(controlnet)
 
         self.register_modules(
             vae=vae,
@@ -255,9 +263,7 @@ class HunyuanDiTControlNetPipeline(DiffusionPipeline):
                 " checker. If you do not want to use the safety checker, you can pass `'safety_checker=None'` instead."
             )
 
-        self.vae_scale_factor = (
-            2 ** (len(self.vae.config.block_out_channels) - 1) if hasattr(self, "vae") and self.vae is not None else 8
-        )
+        self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1) if getattr(self, "vae", None) else 8
         self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor)
         self.register_to_config(requires_safety_checker=requires_safety_checker)
         self.default_sample_size = (
@@ -274,19 +280,19 @@ class HunyuanDiTControlNetPipeline(DiffusionPipeline):
         dtype: torch.dtype = None,
         num_images_per_prompt: int = 1,
         do_classifier_free_guidance: bool = True,
-        negative_prompt: Optional[str] = None,
-        prompt_embeds: Optional[torch.Tensor] = None,
-        negative_prompt_embeds: Optional[torch.Tensor] = None,
-        prompt_attention_mask: Optional[torch.Tensor] = None,
-        negative_prompt_attention_mask: Optional[torch.Tensor] = None,
-        max_sequence_length: Optional[int] = None,
+        negative_prompt: str | None = None,
+        prompt_embeds: torch.Tensor | None = None,
+        negative_prompt_embeds: torch.Tensor | None = None,
+        prompt_attention_mask: torch.Tensor | None = None,
+        negative_prompt_attention_mask: torch.Tensor | None = None,
+        max_sequence_length: int | None = None,
         text_encoder_index: int = 0,
     ):
         r"""
         Encodes the prompt into text encoder hidden states.
 
         Args:
-            prompt (`str` or `List[str]`, *optional*):
+            prompt (`str` or `list[str]`, *optional*):
                 prompt to be encoded
             device: (`torch.device`):
                 torch device
@@ -296,7 +302,7 @@ class HunyuanDiTControlNetPipeline(DiffusionPipeline):
                 number of images that should be generated per prompt
             do_classifier_free_guidance (`bool`):
                 whether to use classifier free guidance or not
-            negative_prompt (`str` or `List[str]`, *optional*):
+            negative_prompt (`str` or `list[str]`, *optional*):
                 The prompt or prompts not to guide the image generation. If not defined, one has to pass
                 `negative_prompt_embeds` instead. Ignored when not using guidance (i.e., ignored if `guidance_scale` is
                 less than `1`).
@@ -385,7 +391,7 @@ class HunyuanDiTControlNetPipeline(DiffusionPipeline):
 
         # get unconditional embeddings for classifier free guidance
         if do_classifier_free_guidance and negative_prompt_embeds is None:
-            uncond_tokens: List[str]
+            uncond_tokens: list[str]
             if negative_prompt is None:
                 uncond_tokens = [""] * batch_size
             elif prompt is not None and type(prompt) is not type(negative_prompt):
@@ -451,7 +457,7 @@ class HunyuanDiTControlNetPipeline(DiffusionPipeline):
     def prepare_extra_step_kwargs(self, generator, eta):
         # prepare extra kwargs for the scheduler step, since not all schedulers have the same signature
         # eta (η) is only used with the DDIMScheduler, it will be ignored for other schedulers.
-        # eta corresponds to η in DDIM paper: https://arxiv.org/abs/2010.02502
+        # eta corresponds to η in DDIM paper: https://huggingface.co/papers/2010.02502
         # and should be between [0, 1]
 
         accepts_eta = "eta" in set(inspect.signature(self.scheduler.step).parameters.keys())
@@ -609,7 +615,7 @@ class HunyuanDiTControlNetPipeline(DiffusionPipeline):
         return self._guidance_rescale
 
     # here `guidance_scale` is defined analog to the guidance weight `w` of equation (2)
-    # of the Imagen paper: https://arxiv.org/pdf/2205.11487.pdf . `guidance_scale = 1`
+    # of the Imagen paper: https://huggingface.co/papers/2205.11487 . `guidance_scale = 1`
     # corresponds to doing no classifier free guidance.
     @property
     def do_classifier_free_guidance(self):
@@ -627,43 +633,41 @@ class HunyuanDiTControlNetPipeline(DiffusionPipeline):
     @replace_example_docstring(EXAMPLE_DOC_STRING)
     def __call__(
         self,
-        prompt: Union[str, List[str]] = None,
-        height: Optional[int] = None,
-        width: Optional[int] = None,
-        num_inference_steps: Optional[int] = 50,
-        guidance_scale: Optional[float] = 5.0,
+        prompt: str | list[str] = None,
+        height: int | None = None,
+        width: int | None = None,
+        num_inference_steps: int | None = 50,
+        guidance_scale: float | None = 5.0,
         control_image: PipelineImageInput = None,
-        controlnet_conditioning_scale: Union[float, List[float]] = 1.0,
-        negative_prompt: Optional[Union[str, List[str]]] = None,
-        num_images_per_prompt: Optional[int] = 1,
-        eta: Optional[float] = 0.0,
-        generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
-        latents: Optional[torch.Tensor] = None,
-        prompt_embeds: Optional[torch.Tensor] = None,
-        prompt_embeds_2: Optional[torch.Tensor] = None,
-        negative_prompt_embeds: Optional[torch.Tensor] = None,
-        negative_prompt_embeds_2: Optional[torch.Tensor] = None,
-        prompt_attention_mask: Optional[torch.Tensor] = None,
-        prompt_attention_mask_2: Optional[torch.Tensor] = None,
-        negative_prompt_attention_mask: Optional[torch.Tensor] = None,
-        negative_prompt_attention_mask_2: Optional[torch.Tensor] = None,
-        output_type: Optional[str] = "pil",
+        controlnet_conditioning_scale: float | list[float] = 1.0,
+        negative_prompt: str | list[str] | None = None,
+        num_images_per_prompt: int | None = 1,
+        eta: float | None = 0.0,
+        generator: torch.Generator | list[torch.Generator] | None = None,
+        latents: torch.Tensor | None = None,
+        prompt_embeds: torch.Tensor | None = None,
+        prompt_embeds_2: torch.Tensor | None = None,
+        negative_prompt_embeds: torch.Tensor | None = None,
+        negative_prompt_embeds_2: torch.Tensor | None = None,
+        prompt_attention_mask: torch.Tensor | None = None,
+        prompt_attention_mask_2: torch.Tensor | None = None,
+        negative_prompt_attention_mask: torch.Tensor | None = None,
+        negative_prompt_attention_mask_2: torch.Tensor | None = None,
+        output_type: str | None = "pil",
         return_dict: bool = True,
-        callback_on_step_end: Optional[
-            Union[Callable[[int, int, Dict], None], PipelineCallback, MultiPipelineCallbacks]
-        ] = None,
-        callback_on_step_end_tensor_inputs: List[str] = ["latents"],
+        callback_on_step_end: Callable[[int, int], None] | PipelineCallback | MultiPipelineCallbacks | None = None,
+        callback_on_step_end_tensor_inputs: list[str] = ["latents"],
         guidance_rescale: float = 0.0,
-        original_size: Optional[Tuple[int, int]] = (1024, 1024),
-        target_size: Optional[Tuple[int, int]] = None,
-        crops_coords_top_left: Tuple[int, int] = (0, 0),
+        original_size: tuple[int, int] | None = (1024, 1024),
+        target_size: tuple[int, int] | None = None,
+        crops_coords_top_left: tuple[int, int] = (0, 0),
         use_resolution_binning: bool = True,
     ):
         r"""
         The call function to the pipeline for generation with HunyuanDiT.
 
         Args:
-            prompt (`str` or `List[str]`, *optional*):
+            prompt (`str` or `list[str]`, *optional*):
                 The prompt or prompts to guide image generation. If not defined, you need to pass `prompt_embeds`.
             height (`int`):
                 The height in pixels of the generated image.
@@ -675,33 +679,33 @@ class HunyuanDiTControlNetPipeline(DiffusionPipeline):
             guidance_scale (`float`, *optional*, defaults to 7.5):
                 A higher guidance scale value encourages the model to generate images closely linked to the text
                 `prompt` at the expense of lower image quality. Guidance scale is enabled when `guidance_scale > 1`.
-            control_guidance_start (`float` or `List[float]`, *optional*, defaults to 0.0):
-                The percentage of total steps at which the ControlNet starts applying.
-            control_guidance_end (`float` or `List[float]`, *optional*, defaults to 1.0):
-                The percentage of total steps at which the ControlNet stops applying.
-            control_image (`torch.Tensor`, `PIL.Image.Image`, `np.ndarray`, `List[torch.Tensor]`, `List[PIL.Image.Image]`, `List[np.ndarray]`,:
-                    `List[List[torch.Tensor]]`, `List[List[np.ndarray]]` or `List[List[PIL.Image.Image]]`):
+            control_image (`torch.Tensor`, `PIL.Image.Image`, `np.ndarray`, `list[torch.Tensor]`, `list[PIL.Image.Image]`, `list[np.ndarray]`,:
+                    `list[list[torch.Tensor]]`, `list[list[np.ndarray]]` or `list[list[PIL.Image.Image]]`):
                 The ControlNet input condition to provide guidance to the `unet` for generation. If the type is
                 specified as `torch.Tensor`, it is passed to ControlNet as is. `PIL.Image.Image` can also be accepted
                 as an image. The dimensions of the output image defaults to `image`'s dimensions. If height and/or
                 width are passed, `image` is resized accordingly. If multiple ControlNets are specified in `init`,
                 images must be passed as a list such that each element of the list can be correctly batched for input
                 to a single ControlNet.
-            controlnet_conditioning_scale (`float` or `List[float]`, *optional*, defaults to 1.0):
+            controlnet_conditioning_scale (`float` or `list[float]`, *optional*, defaults to 1.0):
                 The outputs of the ControlNet are multiplied by `controlnet_conditioning_scale` before they are added
                 to the residual in the original `unet`. If multiple ControlNets are specified in `init`, you can set
                 the corresponding scale as a list.
-            negative_prompt (`str` or `List[str]`, *optional*):
+            negative_prompt (`str` or `list[str]`, *optional*):
                 The prompt or prompts to guide what to not include in image generation. If not defined, you need to
                 pass `negative_prompt_embeds` instead. Ignored when not using guidance (`guidance_scale < 1`).
             num_images_per_prompt (`int`, *optional*, defaults to 1):
                 The number of images to generate per prompt.
             eta (`float`, *optional*, defaults to 0.0):
-                Corresponds to parameter eta (η) from the [DDIM](https://arxiv.org/abs/2010.02502) paper. Only applies
-                to the [`~schedulers.DDIMScheduler`], and is ignored in other schedulers.
-            generator (`torch.Generator` or `List[torch.Generator]`, *optional*):
+                Corresponds to parameter eta (η) from the [DDIM](https://huggingface.co/papers/2010.02502) paper. Only
+                applies to the [`~schedulers.DDIMScheduler`], and is ignored in other schedulers.
+            generator (`torch.Generator` or `list[torch.Generator]`, *optional*):
                 A [`torch.Generator`](https://pytorch.org/docs/stable/generated/torch.Generator.html) to make
                 generation deterministic.
+            latents (`torch.Tensor`, *optional*):
+                Pre-generated noisy latents sampled from a Gaussian distribution, to be used as inputs for image
+                generation. Can be used to tweak the same generation with different prompts. If not provided, a latents
+                tensor is generated by sampling using the supplied random `generator`.
             prompt_embeds (`torch.Tensor`, *optional*):
                 Pre-generated text embeddings. Can be used to easily tweak text inputs (prompt weighting). If not
                 provided, text embeddings are generated from the `prompt` input argument.
@@ -727,19 +731,19 @@ class HunyuanDiTControlNetPipeline(DiffusionPipeline):
             return_dict (`bool`, *optional*, defaults to `True`):
                 Whether or not to return a [`~pipelines.stable_diffusion.StableDiffusionPipelineOutput`] instead of a
                 plain tuple.
-            callback_on_step_end (`Callable[[int, int, Dict], None]`, `PipelineCallback`, `MultiPipelineCallbacks`, *optional*):
+            callback_on_step_end (`Callable[[int, int], None]`, `PipelineCallback`, `MultiPipelineCallbacks`, *optional*):
                 A callback function or a list of callback functions to be called at the end of each denoising step.
-            callback_on_step_end_tensor_inputs (`List[str]`, *optional*):
+            callback_on_step_end_tensor_inputs (`list[str]`, *optional*):
                 A list of tensor inputs that should be passed to the callback function. If not defined, all tensor
                 inputs will be passed.
             guidance_rescale (`float`, *optional*, defaults to 0.0):
                 Rescale the noise_cfg according to `guidance_rescale`. Based on findings of [Common Diffusion Noise
-                Schedules and Sample Steps are Flawed](https://arxiv.org/pdf/2305.08891.pdf). See Section 3.4
-            original_size (`Tuple[int, int]`, *optional*, defaults to `(1024, 1024)`):
+                Schedules and Sample Steps are Flawed](https://huggingface.co/papers/2305.08891). See Section 3.4
+            original_size (`tuple[int, int]`, *optional*, defaults to `(1024, 1024)`):
                 The original size of the image. Used to calculate the time ids.
-            target_size (`Tuple[int, int]`, *optional*):
+            target_size (`tuple[int, int]`, *optional*):
                 The target size of the image. Used to calculate the time ids.
-            crops_coords_top_left (`Tuple[int, int]`, *optional*, defaults to `(0, 0)`):
+            crops_coords_top_left (`tuple[int, int]`, *optional*, defaults to `(0, 0)`):
                 The top left coordinates of the crop. Used to calculate the time ids.
             use_resolution_binning (`bool`, *optional*, defaults to `True`):
                 Whether to use resolution binning or not. If `True`, the input resolution will be mapped to the closest
@@ -911,7 +915,11 @@ class HunyuanDiTControlNetPipeline(DiffusionPipeline):
         base_size = 512 // 8 // self.transformer.config.patch_size
         grid_crops_coords = get_resize_crop_region_for_grid((grid_height, grid_width), base_size)
         image_rotary_emb = get_2d_rotary_pos_embed(
-            self.transformer.inner_dim // self.transformer.num_heads, grid_crops_coords, (grid_height, grid_width)
+            self.transformer.inner_dim // self.transformer.num_heads,
+            grid_crops_coords,
+            (grid_height, grid_width),
+            device=device,
+            output_type="pt",
         )
 
         style = torch.tensor([0], device=device)
@@ -993,7 +1001,7 @@ class HunyuanDiTControlNetPipeline(DiffusionPipeline):
                     noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
 
                 if self.do_classifier_free_guidance and guidance_rescale > 0.0:
-                    # Based on 3.4. in https://arxiv.org/pdf/2305.08891.pdf
+                    # Based on 3.4. in https://huggingface.co/papers/2305.08891
                     noise_pred = rescale_noise_cfg(noise_pred, noise_pred_text, guidance_rescale=guidance_rescale)
 
                 # compute the previous noisy sample x_t -> x_t-1

@@ -1,4 +1,4 @@
-# Copyright 2024 The HuggingFace Team. All rights reserved.
+# Copyright 2025 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import re
-from typing import Dict, List, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -31,7 +30,7 @@ logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
 
 class PAGMixin:
-    r"""Mixin class for [Pertubed Attention Guidance](https://arxiv.org/abs/2403.17377v1)."""
+    r"""Mixin class for [Pertubed Attention Guidance](https://huggingface.co/papers/2403.17377v1)."""
 
     def _set_pag_attn_processor(self, pag_applied_layers, do_classifier_free_guidance):
         r"""
@@ -98,7 +97,9 @@ class PAGMixin:
         else:
             return self.pag_scale
 
-    def _apply_perturbed_attention_guidance(self, noise_pred, do_classifier_free_guidance, guidance_scale, t):
+    def _apply_perturbed_attention_guidance(
+        self, noise_pred, do_classifier_free_guidance, guidance_scale, t, return_pred_text=False
+    ):
         r"""
         Apply perturbed attention guidance to the noise prediction.
 
@@ -107,9 +108,11 @@ class PAGMixin:
             do_classifier_free_guidance (bool): Whether to apply classifier-free guidance.
             guidance_scale (float): The scale factor for the guidance term.
             t (int): The current time step.
+            return_pred_text (bool): Whether to return the text noise prediction.
 
         Returns:
-            torch.Tensor: The updated noise prediction tensor after applying perturbed attention guidance.
+            torch.Tensor | tuple[torch.Tensor, torch.Tensor]: The updated noise prediction tensor after applying
+            perturbed attention guidance and the text noise prediction.
         """
         pag_scale = self._get_pag_scale(t)
         if do_classifier_free_guidance:
@@ -122,6 +125,8 @@ class PAGMixin:
         else:
             noise_pred_text, noise_pred_perturb = noise_pred.chunk(2)
             noise_pred = noise_pred_text + pag_scale * (noise_pred_text - noise_pred_perturb)
+        if return_pred_text:
+            return noise_pred, noise_pred_text
         return noise_pred
 
     def _prepare_perturbed_attention_guidance(self, cond, uncond, do_classifier_free_guidance):
@@ -145,17 +150,17 @@ class PAGMixin:
 
     def set_pag_applied_layers(
         self,
-        pag_applied_layers: Union[str, List[str]],
-        pag_attn_processors: Tuple[AttentionProcessor, AttentionProcessor] = (
+        pag_applied_layers: str | list[str],
+        pag_attn_processors: tuple[AttentionProcessor, AttentionProcessor] = (
             PAGCFGIdentitySelfAttnProcessor2_0(),
             PAGIdentitySelfAttnProcessor2_0(),
         ),
     ):
         r"""
-        Set the the self-attention layers to apply PAG. Raise ValueError if the input is invalid.
+        Set the self-attention layers to apply PAG. Raise ValueError if the input is invalid.
 
         Args:
-            pag_applied_layers (`str` or `List[str]`):
+            pag_applied_layers (`str` or `list[str]`):
                 One or more strings identifying the layer names, or a simple regex for matching multiple layers, where
                 PAG is to be applied. A few ways of expected usage are as follows:
                   - Single layers specified as - "blocks.{layer_index}"
@@ -163,7 +168,7 @@ class PAGMixin:
                   - Multiple layers as a block name - "mid"
                   - Multiple layers as regex - "blocks.({layer_index_1}|{layer_index_2})"
             pag_attn_processors:
-                (`Tuple[AttentionProcessor, AttentionProcessor]`, defaults to `(PAGCFGIdentitySelfAttnProcessor2_0(),
+                (`tuple[AttentionProcessor, AttentionProcessor]`, defaults to `(PAGCFGIdentitySelfAttnProcessor2_0(),
                 PAGIdentitySelfAttnProcessor2_0())`): A tuple of two attention processors. The first attention
                 processor is for PAG with Classifier-free guidance enabled (conditional and unconditional). The second
                 attention processor is for PAG with CFG disabled (unconditional only).
@@ -208,7 +213,7 @@ class PAGMixin:
         return self._pag_scale > 0 and len(self.pag_applied_layers) > 0
 
     @property
-    def pag_attn_processors(self) -> Dict[str, AttentionProcessor]:
+    def pag_attn_processors(self) -> dict[str, AttentionProcessor]:
         r"""
         Returns:
             `dict` of PAG attention processors: A dictionary contains all PAG attention processors used in the model

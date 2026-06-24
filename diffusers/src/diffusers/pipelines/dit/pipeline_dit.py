@@ -4,7 +4,7 @@
 # Copyright (c) 2021 OpenAI
 # MIT License
 #
-# Copyright 2024 The HuggingFace Team. All rights reserved.
+# Copyright 2025 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -18,14 +18,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Dict, List, Optional, Tuple, Union
-
 import torch
 
 from ...models import AutoencoderKL, DiTTransformer2DModel
 from ...schedulers import KarrasDiffusionSchedulers
+from ...utils import is_torch_xla_available
 from ...utils.torch_utils import randn_tensor
 from ..pipeline_utils import DiffusionPipeline, ImagePipelineOutput
+
+
+if is_torch_xla_available():
+    import torch_xla.core.xla_model as xm
+
+    XLA_AVAILABLE = True
+else:
+    XLA_AVAILABLE = False
 
 
 class DiTPipeline(DiffusionPipeline):
@@ -37,7 +44,9 @@ class DiTPipeline(DiffusionPipeline):
 
     Parameters:
         transformer ([`DiTTransformer2DModel`]):
-            A class conditioned `DiTTransformer2DModel` to denoise the encoded image latents.
+            A class conditioned `DiTTransformer2DModel` to denoise the encoded image latents. Initially published as
+            [`Transformer2DModel`](https://huggingface.co/facebook/DiT-XL-2-256/blob/main/transformer/config.json#L2)
+            in the config, but the mismatch can be ignored.
         vae ([`AutoencoderKL`]):
             Variational Auto-Encoder (VAE) model to encode and decode images to and from latent representations.
         scheduler ([`DDIMScheduler`]):
@@ -51,7 +60,7 @@ class DiTPipeline(DiffusionPipeline):
         transformer: DiTTransformer2DModel,
         vae: AutoencoderKL,
         scheduler: KarrasDiffusionSchedulers,
-        id2label: Optional[Dict[int, str]] = None,
+        id2label: dict[int, str] | None = None,
     ):
         super().__init__()
         self.register_modules(transformer=transformer, vae=vae, scheduler=scheduler)
@@ -64,7 +73,7 @@ class DiTPipeline(DiffusionPipeline):
                     self.labels[label.lstrip().rstrip()] = int(key)
             self.labels = dict(sorted(self.labels.items()))
 
-    def get_label_ids(self, label: Union[str, List[str]]) -> List[int]:
+    def get_label_ids(self, label: str | list[str]) -> list[int]:
         r"""
 
         Map label strings from ImageNet to corresponding class ids.
@@ -92,19 +101,19 @@ class DiTPipeline(DiffusionPipeline):
     @torch.no_grad()
     def __call__(
         self,
-        class_labels: List[int],
+        class_labels: list[int],
         guidance_scale: float = 4.0,
-        generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
+        generator: torch.Generator | list[torch.Generator] | None = None,
         num_inference_steps: int = 50,
-        output_type: Optional[str] = "pil",
+        output_type: str | None = "pil",
         return_dict: bool = True,
-    ) -> Union[ImagePipelineOutput, Tuple]:
+    ) -> ImagePipelineOutput | tuple:
         r"""
         The call function to the pipeline for generation.
 
         Args:
-            class_labels (List[int]):
-                List of ImageNet class labels for the images to be generated.
+            class_labels (list[int]):
+                list of ImageNet class labels for the images to be generated.
             guidance_scale (`float`, *optional*, defaults to 4.0):
                 A higher guidance scale value encourages the model to generate images closely linked to the text
                 `prompt` at the expense of lower image quality. Guidance scale is enabled when `guidance_scale > 1`.
@@ -178,10 +187,11 @@ class DiTPipeline(DiffusionPipeline):
                 # TODO: this requires sync between CPU and GPU. So try to pass timesteps as tensors if you can
                 # This would be a good case for the `match` statement (Python 3.10+)
                 is_mps = latent_model_input.device.type == "mps"
+                is_npu = latent_model_input.device.type == "npu"
                 if isinstance(timesteps, float):
-                    dtype = torch.float32 if is_mps else torch.float64
+                    dtype = torch.float32 if (is_mps or is_npu) else torch.float64
                 else:
-                    dtype = torch.int32 if is_mps else torch.int64
+                    dtype = torch.int32 if (is_mps or is_npu) else torch.int64
                 timesteps = torch.tensor([timesteps], dtype=dtype, device=latent_model_input.device)
             elif len(timesteps.shape) == 0:
                 timesteps = timesteps[None].to(latent_model_input.device)
@@ -210,6 +220,9 @@ class DiTPipeline(DiffusionPipeline):
 
             # compute previous image: x_t -> x_t-1
             latent_model_input = self.scheduler.step(model_output, t, latent_model_input).prev_sample
+
+            if XLA_AVAILABLE:
+                xm.mark_step()
 
         if guidance_scale > 1:
             latents, _ = latent_model_input.chunk(2, dim=0)

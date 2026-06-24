@@ -1,4 +1,4 @@
-# Copyright 2024 The HuggingFace Team. All rights reserved.
+# Copyright 2025 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,14 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from typing import Any, Dict, Optional
+from typing import Any
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 
 from ...configuration_utils import LegacyConfigMixin, register_to_config
-from ...utils import deprecate, is_torch_version, logging
+from ...utils import deprecate, logging
 from ..attention import BasicTransformerBlock
 from ..embeddings import ImagePositionalEmbeddings, PatchEmbed, PixArtAlphaTextProjection
 from ..modeling_outputs import Transformer2DModelOutput
@@ -66,24 +66,25 @@ class Transformer2DModel(LegacyModelMixin, LegacyConfigMixin):
 
     _supports_gradient_checkpointing = True
     _no_split_modules = ["BasicTransformerBlock"]
+    _skip_layerwise_casting_patterns = ["latent_image_embedding", "norm"]
 
     @register_to_config
     def __init__(
         self,
         num_attention_heads: int = 16,
         attention_head_dim: int = 88,
-        in_channels: Optional[int] = None,
-        out_channels: Optional[int] = None,
+        in_channels: int | None = None,
+        out_channels: int | None = None,
         num_layers: int = 1,
         dropout: float = 0.0,
         norm_num_groups: int = 32,
-        cross_attention_dim: Optional[int] = None,
+        cross_attention_dim: int | None = None,
         attention_bias: bool = False,
-        sample_size: Optional[int] = None,
-        num_vector_embeds: Optional[int] = None,
-        patch_size: Optional[int] = None,
+        sample_size: int | None = None,
+        num_vector_embeds: int | None = None,
+        patch_size: int | None = None,
         activation_fn: str = "geglu",
-        num_embeds_ada_norm: Optional[int] = None,
+        num_embeds_ada_norm: int | None = None,
         use_linear_projection: bool = False,
         only_cross_attention: bool = False,
         double_self_attention: bool = False,
@@ -94,7 +95,7 @@ class Transformer2DModel(LegacyModelMixin, LegacyConfigMixin):
         attention_type: str = "default",
         caption_channels: int = None,
         interpolation_scale: float = None,
-        use_additional_conditions: Optional[bool] = None,
+        use_additional_conditions: bool | None = None,
     ):
         super().__init__()
 
@@ -210,9 +211,9 @@ class Transformer2DModel(LegacyModelMixin, LegacyConfigMixin):
 
     def _init_vectorized_inputs(self, norm_type):
         assert self.config.sample_size is not None, "Transformer2DModel over discrete input must provide sample_size"
-        assert (
-            self.config.num_vector_embeds is not None
-        ), "Transformer2DModel over discrete input must provide num_embed"
+        assert self.config.num_vector_embeds is not None, (
+            "Transformer2DModel over discrete input must provide num_embed"
+        )
 
         self.height = self.config.sample_size
         self.width = self.config.sample_size
@@ -320,20 +321,16 @@ class Transformer2DModel(LegacyModelMixin, LegacyConfigMixin):
                 in_features=self.caption_channels, hidden_size=self.inner_dim
             )
 
-    def _set_gradient_checkpointing(self, module, value=False):
-        if hasattr(module, "gradient_checkpointing"):
-            module.gradient_checkpointing = value
-
     def forward(
         self,
         hidden_states: torch.Tensor,
-        encoder_hidden_states: Optional[torch.Tensor] = None,
-        timestep: Optional[torch.LongTensor] = None,
-        added_cond_kwargs: Dict[str, torch.Tensor] = None,
-        class_labels: Optional[torch.LongTensor] = None,
-        cross_attention_kwargs: Dict[str, Any] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        encoder_attention_mask: Optional[torch.Tensor] = None,
+        encoder_hidden_states: torch.Tensor | None = None,
+        timestep: torch.LongTensor | None = None,
+        added_cond_kwargs: dict[str, torch.Tensor] = None,
+        class_labels: torch.LongTensor | None = None,
+        cross_attention_kwargs: dict[str, Any] = None,
+        attention_mask: torch.Tensor | None = None,
+        encoder_attention_mask: torch.Tensor | None = None,
         return_dict: bool = True,
     ):
         """
@@ -350,7 +347,7 @@ class Transformer2DModel(LegacyModelMixin, LegacyConfigMixin):
             class_labels ( `torch.LongTensor` of shape `(batch size, num classes)`, *optional*):
                 Used to indicate class labels conditioning. Optional class labels to be applied as an embedding in
                 `AdaLayerZeroNorm`.
-            cross_attention_kwargs ( `Dict[str, Any]`, *optional*):
+            cross_attention_kwargs ( `dict[str, Any]`, *optional*):
                 A kwargs dictionary that if specified is passed along to the `AttentionProcessor` as defined under
                 `self.processor` in
                 [diffusers.models.attention_processor](https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/attention_processor.py).
@@ -415,20 +412,9 @@ class Transformer2DModel(LegacyModelMixin, LegacyConfigMixin):
 
         # 2. Blocks
         for block in self.transformer_blocks:
-            if self.training and self.gradient_checkpointing:
-
-                def create_custom_forward(module, return_dict=None):
-                    def custom_forward(*inputs):
-                        if return_dict is not None:
-                            return module(*inputs, return_dict=return_dict)
-                        else:
-                            return module(*inputs)
-
-                    return custom_forward
-
-                ckpt_kwargs: Dict[str, Any] = {"use_reentrant": False} if is_torch_version(">=", "1.11.0") else {}
-                hidden_states = torch.utils.checkpoint.checkpoint(
-                    create_custom_forward(block),
+            if torch.is_grad_enabled() and self.gradient_checkpointing:
+                hidden_states = self._gradient_checkpointing_func(
+                    block,
                     hidden_states,
                     attention_mask,
                     encoder_hidden_states,
@@ -436,7 +422,6 @@ class Transformer2DModel(LegacyModelMixin, LegacyConfigMixin):
                     timestep,
                     cross_attention_kwargs,
                     class_labels,
-                    **ckpt_kwargs,
                 )
             else:
                 hidden_states = block(

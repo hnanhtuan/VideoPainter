@@ -1,4 +1,4 @@
-# Copyright 2024 The HuggingFace Team. All rights reserved.
+# Copyright 2025 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,7 +14,6 @@
 
 import warnings
 from functools import partial
-from typing import Dict, List, Optional, Union
 
 import jax
 import jax.numpy as jnp
@@ -124,8 +123,8 @@ class FlaxStableDiffusionImg2ImgPipeline(FlaxDiffusionPipeline):
             [`FlaxDPMSolverMultistepScheduler`].
         safety_checker ([`FlaxStableDiffusionSafetyChecker`]):
             Classification module that estimates whether generated images could be considered offensive or harmful.
-            Please refer to the [model card](https://huggingface.co/runwayml/stable-diffusion-v1-5) for more details
-            about a model's potential harms.
+            Please refer to the [model card](https://huggingface.co/stable-diffusion-v1-5/stable-diffusion-v1-5) for
+            more details about a model's potential harms.
         feature_extractor ([`~transformers.CLIPImageProcessor`]):
             A `CLIPImageProcessor` to extract features from generated images; used as inputs to the `safety_checker`.
     """
@@ -136,9 +135,7 @@ class FlaxStableDiffusionImg2ImgPipeline(FlaxDiffusionPipeline):
         text_encoder: FlaxCLIPTextModel,
         tokenizer: CLIPTokenizer,
         unet: FlaxUNet2DConditionModel,
-        scheduler: Union[
-            FlaxDDIMScheduler, FlaxPNDMScheduler, FlaxLMSDiscreteScheduler, FlaxDPMSolverMultistepScheduler
-        ],
+        scheduler: FlaxDDIMScheduler | FlaxPNDMScheduler | FlaxLMSDiscreteScheduler | FlaxDPMSolverMultistepScheduler,
         safety_checker: FlaxStableDiffusionSafetyChecker,
         feature_extractor: CLIPImageProcessor,
         dtype: jnp.dtype = jnp.float32,
@@ -165,9 +162,9 @@ class FlaxStableDiffusionImg2ImgPipeline(FlaxDiffusionPipeline):
             safety_checker=safety_checker,
             feature_extractor=feature_extractor,
         )
-        self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1)
+        self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1) if getattr(self, "vae", None) else 8
 
-    def prepare_inputs(self, prompt: Union[str, List[str]], image: Union[Image.Image, List[Image.Image]]):
+    def prepare_inputs(self, prompt: str | list[str], image: Image.Image | list[Image.Image]):
         if not isinstance(prompt, (str, list)):
             raise ValueError(f"`prompt` has to be of type `str` or `list` but is {type(prompt)}")
 
@@ -234,15 +231,15 @@ class FlaxStableDiffusionImg2ImgPipeline(FlaxDiffusionPipeline):
         self,
         prompt_ids: jnp.ndarray,
         image: jnp.ndarray,
-        params: Union[Dict, FrozenDict],
+        params: dict | FrozenDict,
         prng_seed: jax.Array,
         start_timestep: int,
         num_inference_steps: int,
         height: int,
         width: int,
         guidance_scale: float,
-        noise: Optional[jnp.ndarray] = None,
-        neg_prompt_ids: Optional[jnp.ndarray] = None,
+        noise: jnp.ndarray | None = None,
+        neg_prompt_ids: jnp.ndarray | None = None,
     ):
         if height % 8 != 0 or width % 8 != 0:
             raise ValueError(f"`height` and `width` have to be divisible by 8 but are {height} and {width}.")
@@ -339,13 +336,13 @@ class FlaxStableDiffusionImg2ImgPipeline(FlaxDiffusionPipeline):
         self,
         prompt_ids: jnp.ndarray,
         image: jnp.ndarray,
-        params: Union[Dict, FrozenDict],
+        params: dict | FrozenDict,
         prng_seed: jax.Array,
         strength: float = 0.8,
         num_inference_steps: int = 50,
-        height: Optional[int] = None,
-        width: Optional[int] = None,
-        guidance_scale: Union[float, jnp.ndarray] = 7.5,
+        height: int | None = None,
+        width: int | None = None,
+        guidance_scale: float | jnp.ndarray = 7.5,
         noise: jnp.ndarray = None,
         neg_prompt_ids: jnp.ndarray = None,
         return_dict: bool = True,
@@ -389,12 +386,8 @@ class FlaxStableDiffusionImg2ImgPipeline(FlaxDiffusionPipeline):
             jit (`bool`, defaults to `False`):
                 Whether to run `pmap` versions of the generation and safety scoring functions.
 
-                    <Tip warning={true}>
-
-                    This argument exists because `__call__` is not yet end-to-end pmap-able. It will be removed in a
-                    future release.
-
-                    </Tip>
+                    > [!WARNING] > This argument exists because `__call__` is not yet end-to-end pmap-able. It will be
+                    removed in a > future release.
 
         Examples:
 

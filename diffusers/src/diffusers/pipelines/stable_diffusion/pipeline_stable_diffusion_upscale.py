@@ -1,4 +1,4 @@
-# Copyright 2024 The HuggingFace Team. All rights reserved.
+# Copyright 2025 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,7 +14,7 @@
 
 import inspect
 import warnings
-from typing import Any, Callable, Dict, List, Optional, Union
+from typing import Any, Callable
 
 import numpy as np
 import PIL.Image
@@ -24,17 +24,27 @@ from transformers import CLIPImageProcessor, CLIPTextModel, CLIPTokenizer
 from ...image_processor import PipelineImageInput, VaeImageProcessor
 from ...loaders import FromSingleFileMixin, StableDiffusionLoraLoaderMixin, TextualInversionLoaderMixin
 from ...models import AutoencoderKL, UNet2DConditionModel
-from ...models.attention_processor import (
-    AttnProcessor2_0,
-    XFormersAttnProcessor,
-)
 from ...models.lora import adjust_lora_scale_text_encoder
 from ...schedulers import DDPMScheduler, KarrasDiffusionSchedulers
-from ...utils import USE_PEFT_BACKEND, deprecate, logging, scale_lora_layers, unscale_lora_layers
+from ...utils import (
+    USE_PEFT_BACKEND,
+    deprecate,
+    is_torch_xla_available,
+    logging,
+    scale_lora_layers,
+    unscale_lora_layers,
+)
 from ...utils.torch_utils import randn_tensor
 from ..pipeline_utils import DiffusionPipeline, StableDiffusionMixin
 from . import StableDiffusionPipelineOutput
 
+
+if is_torch_xla_available():
+    import torch_xla.core.xla_model as xm
+
+    XLA_AVAILABLE = True
+else:
+    XLA_AVAILABLE = False
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
@@ -113,9 +123,9 @@ class StableDiffusionUpscalePipeline(
         unet: UNet2DConditionModel,
         low_res_scheduler: DDPMScheduler,
         scheduler: KarrasDiffusionSchedulers,
-        safety_checker: Optional[Any] = None,
-        feature_extractor: Optional[CLIPImageProcessor] = None,
-        watermarker: Optional[Any] = None,
+        safety_checker: Any | None = None,
+        feature_extractor: CLIPImageProcessor | None = None,
+        watermarker: Any | None = None,
         max_noise_level: int = 350,
     ):
         super().__init__()
@@ -149,7 +159,7 @@ class StableDiffusionUpscalePipeline(
             watermarker=watermarker,
             feature_extractor=feature_extractor,
         )
-        self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1)
+        self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1) if getattr(self, "vae", None) else 8
         self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor, resample="bicubic")
         self.register_to_config(max_noise_level=max_noise_level)
 
@@ -178,9 +188,9 @@ class StableDiffusionUpscalePipeline(
         num_images_per_prompt,
         do_classifier_free_guidance,
         negative_prompt=None,
-        prompt_embeds: Optional[torch.Tensor] = None,
-        negative_prompt_embeds: Optional[torch.Tensor] = None,
-        lora_scale: Optional[float] = None,
+        prompt_embeds: torch.Tensor | None = None,
+        negative_prompt_embeds: torch.Tensor | None = None,
+        lora_scale: float | None = None,
         **kwargs,
     ):
         deprecation_message = "`_encode_prompt()` is deprecated and it will be removed in a future version. Use `encode_prompt()` instead. Also, be aware that the output format changed from a concatenated tensor to a tuple."
@@ -211,16 +221,16 @@ class StableDiffusionUpscalePipeline(
         num_images_per_prompt,
         do_classifier_free_guidance,
         negative_prompt=None,
-        prompt_embeds: Optional[torch.Tensor] = None,
-        negative_prompt_embeds: Optional[torch.Tensor] = None,
-        lora_scale: Optional[float] = None,
-        clip_skip: Optional[int] = None,
+        prompt_embeds: torch.Tensor | None = None,
+        negative_prompt_embeds: torch.Tensor | None = None,
+        lora_scale: float | None = None,
+        clip_skip: int | None = None,
     ):
         r"""
         Encodes the prompt into text encoder hidden states.
 
         Args:
-            prompt (`str` or `List[str]`, *optional*):
+            prompt (`str` or `list[str]`, *optional*):
                 prompt to be encoded
             device: (`torch.device`):
                 torch device
@@ -228,7 +238,7 @@ class StableDiffusionUpscalePipeline(
                 number of images that should be generated per prompt
             do_classifier_free_guidance (`bool`):
                 whether to use classifier free guidance or not
-            negative_prompt (`str` or `List[str]`, *optional*):
+            negative_prompt (`str` or `list[str]`, *optional*):
                 The prompt or prompts not to guide the image generation. If not defined, one has to pass
                 `negative_prompt_embeds` instead. Ignored when not using guidance (i.e., ignored if `guidance_scale` is
                 less than `1`).
@@ -327,7 +337,7 @@ class StableDiffusionUpscalePipeline(
 
         # get unconditional embeddings for classifier free guidance
         if do_classifier_free_guidance and negative_prompt_embeds is None:
-            uncond_tokens: List[str]
+            uncond_tokens: list[str]
             if negative_prompt is None:
                 uncond_tokens = [""] * batch_size
             elif prompt is not None and type(prompt) is not type(negative_prompt):
@@ -390,7 +400,7 @@ class StableDiffusionUpscalePipeline(
     def prepare_extra_step_kwargs(self, generator, eta):
         # prepare extra kwargs for the scheduler step, since not all schedulers have the same signature
         # eta (η) is only used with the DDIMScheduler, it will be ignored for other schedulers.
-        # eta corresponds to η in DDIM paper: https://arxiv.org/abs/2010.02502
+        # eta corresponds to η in DDIM paper: https://huggingface.co/papers/2010.02502
         # and should be between [0, 1]
 
         accepts_eta = "eta" in set(inspect.signature(self.scheduler.step).parameters.keys())
@@ -515,51 +525,42 @@ class StableDiffusionUpscalePipeline(
         return latents
 
     def upcast_vae(self):
-        dtype = self.vae.dtype
-        self.vae.to(dtype=torch.float32)
-        use_torch_2_0_or_xformers = isinstance(
-            self.vae.decoder.mid_block.attentions[0].processor,
-            (
-                AttnProcessor2_0,
-                XFormersAttnProcessor,
-            ),
+        deprecate(
+            "upcast_vae",
+            "1.0.0",
+            "`upcast_vae` is deprecated. Please use `pipe.vae.to(torch.float32)`. For more details, please refer to: https://github.com/huggingface/diffusers/pull/12619#issue-3606633695.",
         )
-        # if xformers or torch_2_0 is used attention block does not need
-        # to be in float32 which can save lots of memory
-        if use_torch_2_0_or_xformers:
-            self.vae.post_quant_conv.to(dtype)
-            self.vae.decoder.conv_in.to(dtype)
-            self.vae.decoder.mid_block.to(dtype)
+        self.vae.to(dtype=torch.float32)
 
     @torch.no_grad()
     def __call__(
         self,
-        prompt: Union[str, List[str]] = None,
+        prompt: str | list[str] = None,
         image: PipelineImageInput = None,
         num_inference_steps: int = 75,
         guidance_scale: float = 9.0,
         noise_level: int = 20,
-        negative_prompt: Optional[Union[str, List[str]]] = None,
-        num_images_per_prompt: Optional[int] = 1,
+        negative_prompt: str | list[str] | None = None,
+        num_images_per_prompt: int | None = 1,
         eta: float = 0.0,
-        generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
-        latents: Optional[torch.Tensor] = None,
-        prompt_embeds: Optional[torch.Tensor] = None,
-        negative_prompt_embeds: Optional[torch.Tensor] = None,
-        output_type: Optional[str] = "pil",
+        generator: torch.Generator | list[torch.Generator] | None = None,
+        latents: torch.Tensor | None = None,
+        prompt_embeds: torch.Tensor | None = None,
+        negative_prompt_embeds: torch.Tensor | None = None,
+        output_type: str | None = "pil",
         return_dict: bool = True,
-        callback: Optional[Callable[[int, int, torch.Tensor], None]] = None,
+        callback: Callable[[int, int, torch.Tensor], None] | None = None,
         callback_steps: int = 1,
-        cross_attention_kwargs: Optional[Dict[str, Any]] = None,
+        cross_attention_kwargs: dict[str, Any] | None = None,
         clip_skip: int = None,
     ):
         r"""
         The call function to the pipeline for generation.
 
         Args:
-            prompt (`str` or `List[str]`, *optional*):
+            prompt (`str` or `list[str]`, *optional*):
                 The prompt or prompts to guide image generation. If not defined, you need to pass `prompt_embeds`.
-            image (`torch.Tensor`, `PIL.Image.Image`, `np.ndarray`, `List[torch.Tensor]`, `List[PIL.Image.Image]`, or `List[np.ndarray]`):
+            image (`torch.Tensor`, `PIL.Image.Image`, `np.ndarray`, `list[torch.Tensor]`, `list[PIL.Image.Image]`, or `list[np.ndarray]`):
                 `Image` or tensor representing an image batch to be upscaled.
             num_inference_steps (`int`, *optional*, defaults to 50):
                 The number of denoising steps. More denoising steps usually lead to a higher quality image at the
@@ -567,15 +568,19 @@ class StableDiffusionUpscalePipeline(
             guidance_scale (`float`, *optional*, defaults to 7.5):
                 A higher guidance scale value encourages the model to generate images closely linked to the text
                 `prompt` at the expense of lower image quality. Guidance scale is enabled when `guidance_scale > 1`.
-            negative_prompt (`str` or `List[str]`, *optional*):
+            noise_level (`int`, *optional*, defaults to 20):
+                The amount of noise to add to the upscaled input image. Must be in the range `[0, max_noise_level]`
+                where `max_noise_level` is defined by the scheduler. A higher `noise_level` adds more noise to the
+                input, increasing variation but reducing fidelity to the source image.
+            negative_prompt (`str` or `list[str]`, *optional*):
                 The prompt or prompts to guide what to not include in image generation. If not defined, you need to
                 pass `negative_prompt_embeds` instead. Ignored when not using guidance (`guidance_scale < 1`).
             num_images_per_prompt (`int`, *optional*, defaults to 1):
                 The number of images to generate per prompt.
             eta (`float`, *optional*, defaults to 0.0):
-                Corresponds to parameter eta (η) from the [DDIM](https://arxiv.org/abs/2010.02502) paper. Only applies
-                to the [`~schedulers.DDIMScheduler`], and is ignored in other schedulers.
-            generator (`torch.Generator` or `List[torch.Generator]`, *optional*):
+                Corresponds to parameter eta (η) from the [DDIM](https://huggingface.co/papers/2010.02502) paper. Only
+                applies to the [`~schedulers.DDIMScheduler`], and is ignored in other schedulers.
+            generator (`torch.Generator` or `list[torch.Generator]`, *optional*):
                 A [`torch.Generator`](https://pytorch.org/docs/stable/generated/torch.Generator.html) to make
                 generation deterministic.
             latents (`torch.Tensor`, *optional*):
@@ -663,7 +668,7 @@ class StableDiffusionUpscalePipeline(
 
         device = self._execution_device
         # here `guidance_scale` is defined analog to the guidance weight `w` of equation (2)
-        # of the Imagen paper: https://arxiv.org/pdf/2205.11487.pdf . `guidance_scale = 1`
+        # of the Imagen paper: https://huggingface.co/papers/2205.11487 . `guidance_scale = 1`
         # corresponds to doing no classifier free guidance.
         do_classifier_free_guidance = guidance_scale > 1.0
 
@@ -726,7 +731,7 @@ class StableDiffusionUpscalePipeline(
                 f"Incorrect configuration settings! The config of `pipeline.unet`: {self.unet.config} expects"
                 f" {self.unet.config.in_channels} but received `num_channels_latents`: {num_channels_latents} +"
                 f" `num_channels_image`: {num_channels_image} "
-                f" = {num_channels_latents+num_channels_image}. Please verify the config of"
+                f" = {num_channels_latents + num_channels_image}. Please verify the config of"
                 " `pipeline.unet` or your `image` input."
             )
 
@@ -768,6 +773,9 @@ class StableDiffusionUpscalePipeline(
                     if callback is not None and i % callback_steps == 0:
                         step_idx = i // getattr(self.scheduler, "order", 1)
                         callback(step_idx, t, latents)
+
+                if XLA_AVAILABLE:
+                    xm.mark_step()
 
         if not output_type == "latent":
             # make sure the VAE is in float32 mode, as it overflows in float16

@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2024 The HuggingFace Inc. team.
+# Copyright 2025 The HuggingFace Inc. team.
 # Copyright (c) 2022, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -24,17 +24,18 @@ import os
 import re
 from collections import OrderedDict
 from pathlib import Path
-from typing import Any, Dict, Tuple, Union
+from typing import Any
 
 import numpy as np
-from huggingface_hub import create_repo, hf_hub_download
+from huggingface_hub import DDUFEntry, create_repo, hf_hub_download
 from huggingface_hub.utils import (
     EntryNotFoundError,
+    HfHubHTTPError,
     RepositoryNotFoundError,
     RevisionNotFoundError,
     validate_hf_hub_args,
 )
-from requests import HTTPError
+from typing_extensions import Self
 
 from . import __version__
 from .utils import (
@@ -93,10 +94,10 @@ class ConfigMixin:
     Class attributes:
         - **config_name** (`str`) -- A filename under which the config should stored when calling
           [`~ConfigMixin.save_config`] (should be overridden by parent class).
-        - **ignore_for_config** (`List[str]`) -- A list of attributes that should not be saved in the config (should be
+        - **ignore_for_config** (`list[str]`) -- A list of attributes that should not be saved in the config (should be
           overridden by subclass).
         - **has_compatibles** (`bool`) -- Whether the class has compatible classes (should be overridden by subclass).
-        - **_deprecated_kwargs** (`List[str]`) -- Keyword arguments that are deprecated. Note that the `init` function
+        - **_deprecated_kwargs** (`list[str]`) -- Keyword arguments that are deprecated. Note that the `init` function
           should only have a `kwargs` argument if at least one argument is deprecated (should be overridden by
           subclass).
     """
@@ -106,6 +107,38 @@ class ConfigMixin:
     has_compatibles = False
 
     _deprecated_kwargs = []
+    _auto_class = None
+
+    @classmethod
+    def register_for_auto_class(cls, auto_class="AutoModel"):
+        """
+        Register this class with the given auto class so that it can be loaded with `AutoModel.from_pretrained(...,
+        trust_remote_code=True)`.
+
+        When the config is saved, the resulting `config.json` will include an `auto_map` entry mapping the auto class
+        to this class's module and class name.
+
+        Args:
+            auto_class (`str` or type, *optional*, defaults to `"AutoModel"`):
+                The auto class to register this class with. Can be a string (e.g. `"AutoModel"`) or the class itself.
+                Currently only `"AutoModel"` is supported.
+
+        Example:
+
+        ```python
+        from diffusers import ModelMixin, ConfigMixin
+
+
+        class MyCustomModel(ModelMixin, ConfigMixin): ...
+
+
+        MyCustomModel.register_for_auto_class("AutoModel")
+        ```
+        """
+        if auto_class != "AutoModel":
+            raise ValueError(f"Only 'AutoModel' is supported, got '{auto_class}'.")
+
+        cls._auto_class = auto_class
 
     def register_to_config(self, **kwargs):
         if self.config_name is None:
@@ -142,7 +175,7 @@ class ConfigMixin:
 
         raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
 
-    def save_config(self, save_directory: Union[str, os.PathLike], push_to_hub: bool = False, **kwargs):
+    def save_config(self, save_directory: str | os.PathLike, push_to_hub: bool = False, **kwargs):
         """
         Save a configuration object to the directory specified in `save_directory` so that it can be reloaded using the
         [`~ConfigMixin.from_config`] class method.
@@ -154,7 +187,7 @@ class ConfigMixin:
                 Whether or not to push your model to the Hugging Face Hub after saving it. You can specify the
                 repository you want to push to with `repo_id` (will default to the name of `save_directory` in your
                 namespace).
-            kwargs (`Dict[str, Any]`, *optional*):
+            kwargs (`dict[str, Any]`, *optional*):
                 Additional keyword arguments passed along to the [`~utils.PushToHubMixin.push_to_hub`] method.
         """
         if os.path.isfile(save_directory):
@@ -170,11 +203,12 @@ class ConfigMixin:
 
         if push_to_hub:
             commit_message = kwargs.pop("commit_message", None)
-            private = kwargs.pop("private", False)
+            private = kwargs.pop("private", None)
             create_pr = kwargs.pop("create_pr", False)
             token = kwargs.pop("token", None)
             repo_id = kwargs.pop("repo_id", save_directory.split(os.path.sep)[-1])
             repo_id = create_repo(repo_id, exist_ok=True, private=private, token=token).repo_id
+            subfolder = kwargs.pop("subfolder", None)
 
             self._upload_folder(
                 save_directory,
@@ -182,15 +216,18 @@ class ConfigMixin:
                 token=token,
                 commit_message=commit_message,
                 create_pr=create_pr,
+                subfolder=subfolder,
             )
 
     @classmethod
-    def from_config(cls, config: Union[FrozenDict, Dict[str, Any]] = None, return_unused_kwargs=False, **kwargs):
+    def from_config(
+        cls, config: FrozenDict | dict[str, Any] = None, return_unused_kwargs=False, **kwargs
+    ) -> Self | tuple[Self, dict[str, Any]]:
         r"""
         Instantiate a Python class from a config dictionary.
 
         Parameters:
-            config (`Dict[str, Any]`):
+            config (`dict[str, Any]`):
                 A config dictionary from which the Python class is instantiated. Make sure to only load configuration
                 files of compatible classes.
             return_unused_kwargs (`bool`, *optional*, defaults to `False`):
@@ -287,11 +324,11 @@ class ConfigMixin:
     @validate_hf_hub_args
     def load_config(
         cls,
-        pretrained_model_name_or_path: Union[str, os.PathLike],
+        pretrained_model_name_or_path: str | os.PathLike,
         return_unused_kwargs=False,
         return_commit_hash=False,
         **kwargs,
-    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
         r"""
         Load a model or scheduler configuration.
 
@@ -304,13 +341,13 @@ class ConfigMixin:
                     - A path to a *directory* (for example `./my_model_directory`) containing model weights saved with
                       [`~ConfigMixin.save_config`].
 
-            cache_dir (`Union[str, os.PathLike]`, *optional*):
+            cache_dir (`str | os.PathLike`, *optional*):
                 Path to a directory where a downloaded pretrained model configuration is cached if the standard cache
                 is not used.
             force_download (`bool`, *optional*, defaults to `False`):
                 Whether or not to force the (re-)download of the model weights and configuration files, overriding the
                 cached versions if they exist.
-            proxies (`Dict[str, str]`, *optional*):
+            proxies (`dict[str, str]`, *optional*):
                 A dictionary of proxy servers to use by protocol or endpoint, for example, `{'http': 'foo.bar:3128',
                 'http://hostname': 'foo.bar:4012'}`. The proxies are used on each request.
             output_loading_info(`bool`, *optional*, defaults to `False`):
@@ -347,6 +384,7 @@ class ConfigMixin:
         _ = kwargs.pop("mirror", None)
         subfolder = kwargs.pop("subfolder", None)
         user_agent = kwargs.pop("user_agent", {})
+        dduf_entries: dict[str, DDUFEntry] | None = kwargs.pop("dduf_entries", None)
 
         user_agent = {**user_agent, "file_type": "config"}
         user_agent = http_user_agent(user_agent)
@@ -358,8 +396,15 @@ class ConfigMixin:
                 "`self.config_name` is not defined. Note that one should not load a config from "
                 "`ConfigMixin`. Please make sure to define `config_name` in a class inheriting from `ConfigMixin`"
             )
-
-        if os.path.isfile(pretrained_model_name_or_path):
+        # Custom path for now
+        if dduf_entries:
+            if subfolder is not None:
+                raise ValueError(
+                    "DDUF file only allow for 1 level of directory (e.g transformer/model1/model.safetentors is not allowed). "
+                    "Please check the DDUF structure"
+                )
+            config_file = cls._get_config_file_from_dduf(pretrained_model_name_or_path, dduf_entries)
+        elif os.path.isfile(pretrained_model_name_or_path):
             config_file = pretrained_model_name_or_path
         elif os.path.isdir(pretrained_model_name_or_path):
             if subfolder is not None and os.path.isfile(
@@ -394,7 +439,7 @@ class ConfigMixin:
                 raise EnvironmentError(
                     f"{pretrained_model_name_or_path} is not a local folder and is not a valid model identifier"
                     " listed on 'https://huggingface.co/models'\nIf this is a private repository, make sure to pass a"
-                    " token having permission to this repo with `token` or log in with `huggingface-cli login`."
+                    " token having permission to this repo with `token` or log in with `hf auth login`."
                 )
             except RevisionNotFoundError:
                 raise EnvironmentError(
@@ -406,7 +451,7 @@ class ConfigMixin:
                 raise EnvironmentError(
                     f"{pretrained_model_name_or_path} does not appear to have a file named {cls.config_name}."
                 )
-            except HTTPError as err:
+            except HfHubHTTPError as err:
                 raise EnvironmentError(
                     "There was a specific connection error when trying to load"
                     f" {pretrained_model_name_or_path}:\n{err}"
@@ -426,10 +471,8 @@ class ConfigMixin:
                     f"Otherwise, make sure '{pretrained_model_name_or_path}' is the correct path to a directory "
                     f"containing a {cls.config_name} file"
                 )
-
         try:
-            # Load config dict
-            config_dict = cls._dict_from_json_file(config_file)
+            config_dict = cls._dict_from_json_file(config_file, dduf_entries=dduf_entries)
 
             commit_hash = extract_commit_hash(config_file)
         except (json.JSONDecodeError, UnicodeDecodeError):
@@ -510,6 +553,9 @@ class ConfigMixin:
         # remove private attributes
         config_dict = {k: v for k, v in config_dict.items() if not k.startswith("_")}
 
+        # remove quantization_config
+        config_dict = {k: v for k, v in config_dict.items() if k != "quantization_config"}
+
         # 3. Create keyword arguments that will be passed to __init__ from expected keyword arguments
         init_dict = {}
         for key in expected_keys:
@@ -549,21 +595,24 @@ class ConfigMixin:
         return init_dict, unused_kwargs, hidden_config_dict
 
     @classmethod
-    def _dict_from_json_file(cls, json_file: Union[str, os.PathLike]):
-        with open(json_file, "r", encoding="utf-8") as reader:
-            text = reader.read()
+    def _dict_from_json_file(cls, json_file: str | os.PathLike, dduf_entries: dict[str, DDUFEntry] | None = None):
+        if dduf_entries:
+            text = dduf_entries[json_file].read_text()
+        else:
+            with open(json_file, "r", encoding="utf-8") as reader:
+                text = reader.read()
         return json.loads(text)
 
     def __repr__(self):
         return f"{self.__class__.__name__} {self.to_json_string()}"
 
     @property
-    def config(self) -> Dict[str, Any]:
+    def config(self) -> dict[str, Any]:
         """
         Returns the config of the class as a frozen dictionary
 
         Returns:
-            `Dict[str, Any]`: Config of the class.
+            `dict[str, Any]`: Config of the class.
         """
         return self._internal_dict
 
@@ -584,16 +633,35 @@ class ConfigMixin:
                 value = value.tolist()
             elif isinstance(value, Path):
                 value = value.as_posix()
+            elif hasattr(value, "to_dict") and callable(value.to_dict):
+                value = value.to_dict()
+            elif isinstance(value, list):
+                value = [to_json_saveable(v) for v in value]
             return value
+
+        if "quantization_config" in config_dict:
+            config_dict["quantization_config"] = (
+                config_dict.quantization_config.to_dict()
+                if not isinstance(config_dict.quantization_config, dict)
+                else config_dict.quantization_config
+            )
 
         config_dict = {k: to_json_saveable(v) for k, v in config_dict.items()}
         # Don't save "_ignore_files" or "_use_default_values"
         config_dict.pop("_ignore_files", None)
         config_dict.pop("_use_default_values", None)
+        # pop the `_pre_quantization_dtype` as torch.dtypes are not serializable.
+        _ = config_dict.pop("_pre_quantization_dtype", None)
+
+        if getattr(self, "_auto_class", None) is not None:
+            module = self.__class__.__module__.split(".")[-1]
+            auto_map = config_dict.get("auto_map", {})
+            auto_map[self._auto_class] = f"{module}.{self.__class__.__name__}"
+            config_dict["auto_map"] = auto_map
 
         return json.dumps(config_dict, indent=2, sort_keys=True) + "\n"
 
-    def to_json_file(self, json_file_path: Union[str, os.PathLike]):
+    def to_json_file(self, json_file_path: str | os.PathLike):
         """
         Save the configuration instance's parameters to a JSON file.
 
@@ -603,6 +671,20 @@ class ConfigMixin:
         """
         with open(json_file_path, "w", encoding="utf-8") as writer:
             writer.write(self.to_json_string())
+
+    @classmethod
+    def _get_config_file_from_dduf(cls, pretrained_model_name_or_path: str, dduf_entries: dict[str, DDUFEntry]):
+        # paths inside a DDUF file must always be "/"
+        config_file = (
+            cls.config_name
+            if pretrained_model_name_or_path == ""
+            else "/".join([pretrained_model_name_or_path, cls.config_name])
+        )
+        if config_file not in dduf_entries:
+            raise ValueError(
+                f"We did not manage to find the file {config_file} in the dduf file. We only have the following files {dduf_entries.keys()}"
+            )
+        return config_file
 
 
 def register_to_config(init):
@@ -710,11 +792,14 @@ class LegacyConfigMixin(ConfigMixin):
     """
 
     @classmethod
-    def from_config(cls, config: Union[FrozenDict, Dict[str, Any]] = None, return_unused_kwargs=False, **kwargs):
+    def from_config(cls, config: FrozenDict | dict[str, Any] = None, return_unused_kwargs=False, **kwargs):
         # To prevent dependency import problem.
         from .models.model_loading_utils import _fetch_remapped_cls_from_config
 
         # resolve remapping
         remapped_class = _fetch_remapped_cls_from_config(config, cls)
 
-        return remapped_class.from_config(config, return_unused_kwargs, **kwargs)
+        if remapped_class is cls:
+            return super(LegacyConfigMixin, remapped_class).from_config(config, return_unused_kwargs, **kwargs)
+        else:
+            return remapped_class.from_config(config, return_unused_kwargs, **kwargs)

@@ -1,4 +1,4 @@
-# Copyright 2024 The HuggingFace Team. All rights reserved.
+# Copyright 2025 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,7 +14,6 @@
 
 import math
 from dataclasses import dataclass
-from typing import Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -27,7 +26,7 @@ from ..attention_processor import Attention
 from ..modeling_utils import ModelMixin
 
 
-# Copied from diffusers.pipelines.wuerstchen.modeling_wuerstchen_common.WuerstchenLayerNorm with WuerstchenLayerNorm -> SDCascadeLayerNorm
+# Copied from diffusers.pipelines.deprecated.wuerstchen.modeling_wuerstchen_common.WuerstchenLayerNorm with WuerstchenLayerNorm -> SDCascadeLayerNorm
 class SDCascadeLayerNorm(nn.LayerNorm):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -145,30 +144,30 @@ class StableCascadeUNet(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         timestep_ratio_embedding_dim: int = 64,
         patch_size: int = 1,
         conditioning_dim: int = 2048,
-        block_out_channels: Tuple[int] = (2048, 2048),
-        num_attention_heads: Tuple[int] = (32, 32),
-        down_num_layers_per_block: Tuple[int] = (8, 24),
-        up_num_layers_per_block: Tuple[int] = (24, 8),
-        down_blocks_repeat_mappers: Optional[Tuple[int]] = (
+        block_out_channels: tuple[int, ...] = (2048, 2048),
+        num_attention_heads: tuple[int, ...] = (32, 32),
+        down_num_layers_per_block: tuple[int, ...] = (8, 24),
+        up_num_layers_per_block: tuple[int, ...] = (24, 8),
+        down_blocks_repeat_mappers: tuple[int] | None = (
             1,
             1,
         ),
-        up_blocks_repeat_mappers: Optional[Tuple[int]] = (1, 1),
-        block_types_per_layer: Tuple[Tuple[str]] = (
+        up_blocks_repeat_mappers: tuple[int] | None = (1, 1),
+        block_types_per_layer: tuple[tuple[str]] = (
             ("SDCascadeResBlock", "SDCascadeTimestepBlock", "SDCascadeAttnBlock"),
             ("SDCascadeResBlock", "SDCascadeTimestepBlock", "SDCascadeAttnBlock"),
         ),
-        clip_text_in_channels: Optional[int] = None,
+        clip_text_in_channels: int | None = None,
         clip_text_pooled_in_channels=1280,
-        clip_image_in_channels: Optional[int] = None,
+        clip_image_in_channels: int | None = None,
         clip_seq=4,
-        effnet_in_channels: Optional[int] = None,
-        pixel_mapper_in_channels: Optional[int] = None,
+        effnet_in_channels: int | None = None,
+        pixel_mapper_in_channels: int | None = None,
         kernel_size=3,
-        dropout: Union[float, Tuple[float]] = (0.1, 0.1),
-        self_attn: Union[bool, Tuple[bool]] = True,
-        timestep_conditioning_type: Tuple[str] = ("sca", "crp"),
-        switch_level: Optional[Tuple[bool]] = None,
+        dropout: float | tuple[float] = (0.1, 0.1),
+        self_attn: bool | tuple[bool] = True,
+        timestep_conditioning_type: tuple[str, ...] = ("sca", "crp"),
+        switch_level: tuple[bool] | None = None,
     ):
         """
 
@@ -183,20 +182,20 @@ class StableCascadeUNet(ModelMixin, ConfigMixin, FromOriginalModelMixin):
                 Patch size to use for pixel unshuffling layer
             conditioning_dim (`int`, defaults to 2048):
                 Dimension of the image and text conditional embedding.
-            block_out_channels (Tuple[int], defaults to (2048, 2048)):
-                Tuple of output channels for each block.
-            num_attention_heads (Tuple[int], defaults to (32, 32)):
+            block_out_channels (tuple[int], defaults to (2048, 2048)):
+                tuple of output channels for each block.
+            num_attention_heads (tuple[int], defaults to (32, 32)):
                 Number of attention heads in each attention block. Set to -1 to if block types in a layer do not have
                 attention.
-            down_num_layers_per_block (Tuple[int], defaults to [8, 24]):
+            down_num_layers_per_block (tuple[int], defaults to [8, 24]):
                 Number of layers in each down block.
-            up_num_layers_per_block (Tuple[int], defaults to [24, 8]):
+            up_num_layers_per_block (tuple[int], defaults to [24, 8]):
                 Number of layers in each up block.
-            down_blocks_repeat_mappers (Tuple[int], optional, defaults to [1, 1]):
+            down_blocks_repeat_mappers (tuple[int], optional, defaults to [1, 1]):
                 Number of 1x1 Convolutional layers to repeat in each down block.
-            up_blocks_repeat_mappers (Tuple[int], optional, defaults to [1, 1]):
+            up_blocks_repeat_mappers (tuple[int], optional, defaults to [1, 1]):
                 Number of 1x1 Convolutional layers to repeat in each up block.
-            block_types_per_layer (Tuple[Tuple[str]], optional,
+            block_types_per_layer (tuple[tuple[str]], optional,
                 defaults to (
                     ("SDCascadeResBlock", "SDCascadeTimestepBlock", "SDCascadeAttnBlock"), ("SDCascadeResBlock",
                     "SDCascadeTimestepBlock", "SDCascadeAttnBlock")
@@ -214,14 +213,14 @@ class StableCascadeUNet(ModelMixin, ConfigMixin, FromOriginalModelMixin):
                 Number of input channels for pixel mapper conditioning.
             kernel_size (`int`, *optional*, defaults to 3):
                 Kernel size to use in the block convolutional layers.
-            dropout (Tuple[float], *optional*, defaults to (0.1, 0.1)):
+            dropout (tuple[float], *optional*, defaults to (0.1, 0.1)):
                 Dropout to use per block.
-            self_attn (Union[bool, Tuple[bool]]):
-                Tuple of booleans that determine whether to use self attention in a block or not.
-            timestep_conditioning_type (Tuple[str], defaults to ("sca", "crp")):
+            self_attn (bool | tuple[bool]):
+                tuple of booleans that determine whether to use self attention in a block or not.
+            timestep_conditioning_type (tuple[str], defaults to ("sca", "crp")):
                 Timestep conditioning type.
-            switch_level (Optional[Tuple[bool]], *optional*, defaults to `None`):
-                Tuple that indicates whether upsampling or downsampling should be applied in a block
+            switch_level (tuple[bool] | None, *optional*, defaults to `None`):
+                tuple that indicates whether upsampling or downsampling should be applied in a block
         """
 
         super().__init__()
@@ -387,9 +386,6 @@ class StableCascadeUNet(ModelMixin, ConfigMixin, FromOriginalModelMixin):
 
         self.gradient_checkpointing = False
 
-    def _set_gradient_checkpointing(self, value=False):
-        self.gradient_checkpointing = value
-
     def _init_weights(self, m):
         if isinstance(m, (nn.Conv2d, nn.Linear)):
             torch.nn.init.xavier_uniform_(m.weight)
@@ -455,30 +451,19 @@ class StableCascadeUNet(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         level_outputs = []
         block_group = zip(self.down_blocks, self.down_downscalers, self.down_repeat_mappers)
 
-        if self.training and self.gradient_checkpointing:
-
-            def create_custom_forward(module):
-                def custom_forward(*inputs):
-                    return module(*inputs)
-
-                return custom_forward
-
+        if torch.is_grad_enabled() and self.gradient_checkpointing:
             for down_block, downscaler, repmap in block_group:
                 x = downscaler(x)
                 for i in range(len(repmap) + 1):
                     for block in down_block:
                         if isinstance(block, SDCascadeResBlock):
-                            x = torch.utils.checkpoint.checkpoint(create_custom_forward(block), x, use_reentrant=False)
+                            x = self._gradient_checkpointing_func(block, x)
                         elif isinstance(block, SDCascadeAttnBlock):
-                            x = torch.utils.checkpoint.checkpoint(
-                                create_custom_forward(block), x, clip, use_reentrant=False
-                            )
+                            x = self._gradient_checkpointing_func(block, x, clip)
                         elif isinstance(block, SDCascadeTimestepBlock):
-                            x = torch.utils.checkpoint.checkpoint(
-                                create_custom_forward(block), x, r_embed, use_reentrant=False
-                            )
+                            x = self._gradient_checkpointing_func(block, x, r_embed)
                         else:
-                            x = torch.utils.checkpoint.checkpoint(create_custom_forward(block), use_reentrant=False)
+                            x = self._gradient_checkpointing_func(block)
                     if i < len(repmap):
                         x = repmap[i](x)
                 level_outputs.insert(0, x)
@@ -504,14 +489,7 @@ class StableCascadeUNet(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         x = level_outputs[0]
         block_group = zip(self.up_blocks, self.up_upscalers, self.up_repeat_mappers)
 
-        if self.training and self.gradient_checkpointing:
-
-            def create_custom_forward(module):
-                def custom_forward(*inputs):
-                    return module(*inputs)
-
-                return custom_forward
-
+        if torch.is_grad_enabled() and self.gradient_checkpointing:
             for i, (up_block, upscaler, repmap) in enumerate(block_group):
                 for j in range(len(repmap) + 1):
                     for k, block in enumerate(up_block):
@@ -523,19 +501,13 @@ class StableCascadeUNet(ModelMixin, ConfigMixin, FromOriginalModelMixin):
                                     x.float(), skip.shape[-2:], mode="bilinear", align_corners=True
                                 )
                                 x = x.to(orig_type)
-                            x = torch.utils.checkpoint.checkpoint(
-                                create_custom_forward(block), x, skip, use_reentrant=False
-                            )
+                            x = self._gradient_checkpointing_func(block, x, skip)
                         elif isinstance(block, SDCascadeAttnBlock):
-                            x = torch.utils.checkpoint.checkpoint(
-                                create_custom_forward(block), x, clip, use_reentrant=False
-                            )
+                            x = self._gradient_checkpointing_func(block, x, clip)
                         elif isinstance(block, SDCascadeTimestepBlock):
-                            x = torch.utils.checkpoint.checkpoint(
-                                create_custom_forward(block), x, r_embed, use_reentrant=False
-                            )
+                            x = self._gradient_checkpointing_func(block, x, r_embed)
                         else:
-                            x = torch.utils.checkpoint.checkpoint(create_custom_forward(block), x, use_reentrant=False)
+                            x = self._gradient_checkpointing_func(block, x)
                     if j < len(repmap):
                         x = repmap[j](x)
                 x = upscaler(x)
@@ -576,6 +548,28 @@ class StableCascadeUNet(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         crp=None,
         return_dict=True,
     ):
+        r"""
+        Args:
+            sample (`torch.Tensor`): The noisy input sample.
+            timestep_ratio (`torch.Tensor`):
+                Timestep ratio used to compute the timestep embedding.
+            clip_text_pooled (`torch.Tensor`):
+                Pooled CLIP text embeddings.
+            clip_text (`torch.Tensor`, *optional*):
+                Sequence-level CLIP text embeddings.
+            clip_img (`torch.Tensor`, *optional*):
+                CLIP image embeddings.
+            effnet (`torch.Tensor`, *optional*):
+                EfficientNet feature map used as additional conditioning.
+            pixels (`torch.Tensor`, *optional*):
+                Pixel-level conditioning tensor. If `None`, a tensor of zeros is used.
+            sca (`torch.Tensor`, *optional*):
+                Optional `sca` conditioning value used to build the timestep embedding.
+            crp (`torch.Tensor`, *optional*):
+                Optional `crp` conditioning value used to build the timestep embedding.
+            return_dict (`bool`, *optional*, defaults to `True`):
+                Whether or not to return a [`StableCascadeUNetOutput`] instead of a plain tuple.
+        """
         if pixels is None:
             pixels = sample.new_zeros(sample.size(0), 3, 8, 8)
 
